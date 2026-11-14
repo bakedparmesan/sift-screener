@@ -1,7 +1,8 @@
-/* Sift Screener — swipe-based title/abstract screening that writes decisions back to Excel.
- * Everything runs in the browser. Projects live in IndexedDB on this device.
- * On desktop Chrome/Edge the Excel file itself is updated in the background (File System Access API).
- * Elsewhere (iPhone, Android, Safari, Firefox) "Save Excel" hands you the updated file. */
+/* Sift — swipe-based title/abstract screening that writes decisions back to Excel.
+ * A project is a named review holding one or more spreadsheet files (e.g. one export per database).
+ * Everything runs in the browser; projects live in IndexedDB on this device.
+ * On desktop Chrome/Edge each Excel file is updated in the background (File System Access API).
+ * Elsewhere (iPhone, Android, Safari, Firefox) "Save Excel" hands you the updated files. */
 (() => {
   'use strict';
 
@@ -21,18 +22,51 @@
   })();
   const isTouch = window.matchMedia('(pointer: coarse)').matches;
 
-  /* ------------------------------------------------------------------ storage */
+  /* ------------------------------------------------------------------ storage
+   * projects: { id, name, fileIds[], pos:{t,a}, sample, createdAt, updatedAt, stats }
+   * sources:  { id, projectId, fileName, ext, sheet, cols, newHeaders, fingerprint, decisions:{t,a}, unsaved, stats }
+   * files:    { id (= source id), bytes, handle } */
   let idb = null;
-  const mem = { projects: new Map(), files: new Map() };
+  const mem = { projects: new Map(), sources: new Map(), files: new Map() };
 
+  function convertPos(o) {
+    const out = { t: null, a: null };
+    for (const k of ['t', 'a']) {
+      const v = o.pos && o.pos[k];
+      out[k] = v == null ? null : v === -1 ? -1 : { sid: o.id, r: v };
+    }
+    return out;
+  }
   function openIDB() {
     return new Promise(resolve => {
       try {
-        const rq = indexedDB.open('sift-screener', 1);
-        rq.onupgradeneeded = () => {
+        const rq = indexedDB.open('sift-screener', 2);
+        rq.onupgradeneeded = ev => {
           const d = rq.result;
-          d.createObjectStore('projects', { keyPath: 'id' });
-          d.createObjectStore('files', { keyPath: 'id' });
+          const tx = rq.transaction;
+          if (ev.oldVersion < 1) {
+            d.createObjectStore('projects', { keyPath: 'id' });
+            d.createObjectStore('files', { keyPath: 'id' });
+          }
+          if (ev.oldVersion < 2) {
+            const src = d.createObjectStore('sources', { keyPath: 'id' });
+            if (ev.oldVersion >= 1) {
+              // v1 stored one file per project: turn each into a project holding that one file.
+              const ps = tx.objectStore('projects');
+              ps.getAll().onsuccess = e => {
+                for (const o of e.target.result || []) {
+                  if (o.fileIds) continue;
+                  const pid = 'P' + o.id;
+                  const s = { ...o, projectId: pid, addedAt: o.createdAt || Date.now() };
+                  delete s.pos; delete s.name; delete s.sample; delete s.live;
+                  src.put(s);
+                  ps.delete(o.id);
+                  ps.put({ id: pid, name: o.name, fileIds: [o.id], pos: convertPos(o), sample: !!o.sample, stats: o.stats,
+                    createdAt: o.createdAt || Date.now(), updatedAt: o.updatedAt || Date.now() });
+                }
+              };
+            }
+          }
         };
         rq.onsuccess = () => resolve(rq.result);
         rq.onerror = () => resolve(null);
@@ -66,13 +100,17 @@
     put: (s, v) => req(s, 'readwrite', st => st.put(v)),
     del: (s, k) => req(s, 'readwrite', st => st.delete(k)),
   };
+  const storageFail = () => toast('Couldn’t save progress on this device. Check that site storage is allowed.', 5000);
+  const saveProject = p => db.put('projects', p).catch(storageFail);
+  const saveSource = s => db.put('sources', s).catch(storageFail);
 
   /* ------------------------------------------------------------------ helpers */
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const fmt = n => Number(n || 0).toLocaleString();
   const baseName = f => String(f || '').replace(/\.[^.]+$/, '');
   const extOf = f => (String(f || '').match(/\.([^.]+)$/) || [, ''])[1].toLowerCase();
-  const uid = () => 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  const uid = p => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  const plural = (n, w) => `${fmt(n)} ${w}${n === 1 ? '' : 's'}`;
 
   let toastTimer = null;
   function toast(msg, ms = 2600) {
@@ -89,6 +127,7 @@
     check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
     q: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 9a3 3 0 115 2.2c-1.2.8-2 1.4-2 2.8"/><path d="M12 18h.01"/></svg>',
     chev: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>',
+    file: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M9 12h6M9 16h6"/></svg>',
   };
 
   /* ------------------------------------------------------------------ spreadsheet */
@@ -137,62 +176,79 @@
     for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
     return (h >>> 0).toString(36);
   }
-  function applyDecisions(ws, p) {
+  function applyDecisions(ws, s) {
     const rg = rangeOf(ws);
     let maxC = rg.e.c;
-    for (const [c, name] of Object.entries(p.newHeaders || {})) {
+    for (const [c, name] of Object.entries(s.newHeaders || {})) {
       const addr = XL.utils.encode_cell({ r: rg.s.r, c: +c });
       if (!ws[addr] || ws[addr].v == null || ws[addr].v === '') ws[addr] = { t: 's', v: name };
       maxC = Math.max(maxC, +c);
     }
-    for (const [key, col] of [['t', p.cols.titleDec], ['a', p.cols.absDec]]) {
+    for (const [key, col] of [['t', s.cols.titleDec], ['a', s.cols.absDec]]) {
       maxC = Math.max(maxC, col);
-      for (const [r, v] of Object.entries(p.decisions[key])) {
+      for (const [r, v] of Object.entries(s.decisions[key])) {
         ws[XL.utils.encode_cell({ r: +r, c: col })] = { t: 'n', v };
       }
     }
     rg.e.c = maxC;
     ws['!ref'] = XL.utils.encode_range(rg);
   }
-  function outputFile(p, wb) {
-    const ws = wb.Sheets[p.sheet];
-    applyDecisions(ws, p);
-    if (p.ext === 'csv') {
+  function outputFile(src) {
+    const s = src.s;
+    const ws = src.wb.Sheets[s.sheet];
+    applyDecisions(ws, s);
+    if (s.ext === 'csv') {
       const csv = XL.utils.sheet_to_csv(ws);
-      return { name: p.fileName, blob: new Blob(['﻿' + csv], { type: 'text/csv' }) };
+      return { name: s.fileName, blob: new Blob(['﻿' + csv], { type: 'text/csv' }) };
     }
-    const out = XL.write(wb, { bookType: 'xlsx', type: 'array', cellStyles: true, compression: true });
-    const name = p.ext === 'xlsx' ? p.fileName : baseName(p.fileName) + '.xlsx';
+    const out = XL.write(src.wb, { bookType: 'xlsx', type: 'array', cellStyles: true, compression: true });
+    const name = s.ext === 'xlsx' ? s.fileName : baseName(s.fileName) + '.xlsx';
     return { name, blob: new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) };
+  }
+  function mergeFileDecisions(s, rows) {
+    for (const x of rows) {
+      if (x.ft !== undefined && s.decisions.t[x.r] === undefined) s.decisions.t[x.r] = x.ft;
+      if (x.fa !== undefined && s.decisions.a[x.r] === undefined) s.decisions.a[x.r] = x.fa;
+    }
   }
 
   /* ------------------------------------------------------------------ state */
   let projects = [];
-  let cur = null;    // { p, wb, ws, rows, handle, live }
-  let screen = null; // { stage, queue, qi }
+  let cur = null;    // { p, srcs: [{ s, wb, rows, handle, live, reconnect }] }
+  let screen = null; // { stage, queue: [{ k, x }], qi, busy }
   let view = 'home';
 
-  function stats(p, rows) {
-    const d = p.decisions;
-    const s = { t: { total: rows.length, done: 0, 1: 0, 0: 0, 2: 0 }, a: { total: 0, done: 0, 1: 0, 0: 0, 2: 0 } };
+  const emptyStats = () => ({ t: { total: 0, done: 0, 1: 0, 0: 0, 2: 0 }, a: { total: 0, done: 0, 1: 0, 0: 0, 2: 0 } });
+  function sourceStats(s, rows) {
+    const d = s.decisions;
+    const st = emptyStats();
+    st.t.total = rows.length;
     for (const x of rows) {
       const tv = d.t[x.r];
-      if (tv !== undefined) { s.t.done++; s.t[tv]++; }
+      if (tv !== undefined) { st.t.done++; st.t[tv]++; }
       if (tv === INCLUDE || tv === MAYBE) {
-        s.a.total++;
+        st.a.total++;
         const av = d.a[x.r];
-        if (av !== undefined) { s.a.done++; s.a[av]++; }
+        if (av !== undefined) { st.a.done++; st.a[av]++; }
       }
     }
-    return s;
+    return st;
   }
-  function saveProject(p) {
-    return db.put('projects', p).catch(() => toast('Couldn’t save progress on this device. Check that site storage is allowed.', 5000));
+  function addStats(a, b) {
+    for (const k of ['t', 'a']) for (const f of ['total', 'done', 1, 0, 2]) a[k][f] += b[k][f];
+    return a;
+  }
+  function refreshStats() {
+    const total = emptyStats();
+    for (const src of cur.srcs) { src.s.stats = sourceStats(src.s, src.rows); addStats(total, src.s.stats); }
+    cur.p.stats = total;
+    return total;
   }
   async function loadProjects() {
     projects = (await db.all('projects').catch(() => [])) || [];
     projects.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
   }
+  const touchProject = () => { cur.p.updatedAt = Date.now(); saveProject(cur.p); };
 
   /* ------------------------------------------------------------------ home */
   function barHTML(s) {
@@ -203,13 +259,15 @@
   function renderHome() {
     view = 'home'; cur = null; screen = null;
     const list = projects.map(p => {
-      const s = p.stats || { t: { total: 0, done: 0 }, a: { total: 0, done: 0 } };
+      const s = p.stats || emptyStats();
+      const n = (p.fileIds || []).length;
       return `<button class="project" data-open="${esc(p.id)}">
         <span class="p-name">${esc(p.name)}${p.sample ? ' <span class="tag">Example data</span>' : ''}</span>
         <span class="chev">${ICON.chev}</span>
         <span class="p-meta num">
-          <span>${barHTML(s.t)}Titles ${fmt(s.t.done)} / ${fmt(s.t.total)}</span>
-          <span>${barHTML(s.a)}Abstracts ${fmt(s.a.done)} / ${fmt(s.a.total)}</span>
+          <span>${n ? plural(n, 'file') : 'No files yet'}</span>
+          ${n ? `<span>${barHTML(s.t)}Titles ${fmt(s.t.done)} / ${fmt(s.t.total)}</span>
+          <span>${barHTML(s.a)}Abstracts ${fmt(s.a.done)} / ${fmt(s.a.total)}</span>` : ''}
         </span>
       </button>`;
     }).join('');
@@ -225,21 +283,56 @@
       ` : `
         <div class="empty">
           <h1>Screen records by swiping</h1>
-          <p class="note">Open your search results as an Excel or CSV file. Swipe right to include, left to exclude, up for maybe. Every decision is written to your screening columns as 1, 0 or 2.</p>
+          <p class="note">Create a project for your review, then add your search results as Excel or CSV files. Swipe right to include, left to exclude, up for maybe. Every decision is written to your screening columns as 1, 0 or 2.</p>
           <div class="row">
-            <button class="btn primary" data-act="new">Open Excel file</button>
+            <button class="btn primary" data-act="new">New project</button>
             <button class="btn" data-act="sample">Try with example records</button>
           </div>
         </div>
       `}
       <p class="note">${canLiveSave
-        ? 'On this browser, decisions are written straight into your Excel file as you swipe.'
-        : 'Progress is saved on this device after every swipe. Use <b>Save Excel</b> to get the updated spreadsheet. For automatic saving into the file itself, open Sift in Chrome or Edge on a computer.'}</p>
+        ? 'On this browser, decisions are written straight into your Excel files as you swipe.'
+        : 'Progress is saved on this device after every swipe. Use <b>Save Excel</b> to get the updated spreadsheets. For automatic saving into the files themselves, open Sift in Chrome or Edge on a computer.'}</p>
       ${projects.length ? '<div><button class="link" data-act="sample">Add an example project</button></div>' : ''}
     </div></section>`;
   }
 
-  /* ------------------------------------------------------------------ opening files */
+  /* ------------------------------------------------------------------ new project */
+  function renderNewProject() {
+    view = 'new';
+    app.innerHTML = `<section class="view"><div class="wrap">
+      <div><button class="link" data-act="home">${ICON.back} Projects</button></div>
+      <h1>New project</h1>
+      <form class="fields" id="np-form" autocomplete="off">
+        <div class="field">
+          <label for="np-name">Project name</label>
+          <input id="np-name" class="text" type="text" maxlength="120" placeholder="e.g. Exercise for knee osteoarthritis" required>
+          <span class="hint">You can add several files to a project, such as one export per database.</span>
+        </div>
+        <div class="row"><button class="btn primary" id="np-go" type="submit" disabled>Create project</button></div>
+      </form>
+    </div></section>`;
+    const input = document.getElementById('np-name');
+    const go = document.getElementById('np-go');
+    input.addEventListener('input', () => { go.disabled = !input.value.trim(); });
+    document.getElementById('np-form').addEventListener('submit', async e => {
+      e.preventDefault();
+      const name = input.value.trim();
+      if (!name) return;
+      const p = await createProject(name, false);
+      cur = { p, srcs: [] };
+      renderProject();
+    });
+    setTimeout(() => input.focus(), 50);
+  }
+  async function createProject(name, sample) {
+    const p = { id: uid('P'), name, fileIds: [], pos: { t: null, a: null }, sample, createdAt: Date.now(), updatedAt: Date.now(), stats: emptyStats() };
+    await saveProject(p);
+    await loadProjects();
+    return p;
+  }
+
+  /* ------------------------------------------------------------------ adding files */
   async function pickFile() {
     if (canLiveSave) {
       try {
@@ -255,7 +348,6 @@
         return startImport(file, handle);
       } catch (e) {
         if (e && e.name === 'AbortError') return;
-        // fall through to the plain picker
       }
     }
     fileInput.value = '';
@@ -267,6 +359,7 @@
   });
 
   async function startImport(file, handle) {
+    if (!cur) return;
     const ext = extOf(file.name);
     if (!['xlsx', 'xls', 'csv', 'xlsm'].includes(ext)) { toast('Choose an .xlsx, .xls or .csv file.'); return; }
     let bytes, wb;
@@ -278,7 +371,7 @@
       return;
     }
     if (!wb.SheetNames.length) { toast('That file has no sheets.'); return; }
-    renderMap({ fileName: file.name, ext, bytes, handle, wb, sheet: wb.SheetNames[0], existing: null, sample: false });
+    renderMap({ fileName: file.name, ext, bytes, handle, wb, sheet: wb.SheetNames[0], existing: null });
   }
 
   /* ------------------------------------------------------------------ column mapping */
@@ -294,16 +387,23 @@
     const headers = headersOf(ws);
     const ex = draft.existing;
     const prev = ex && ex.sheet === draft.sheet ? ex.cols : null;
+    // Reuse the column choices of another file in this project with the same headers.
+    const sibling = !ex && cur.srcs.find(src => {
+      const h = headersOf(src.wb.Sheets[src.s.sheet]).map(x => x.name).join('|');
+      return h === headers.map(x => x.name).join('|');
+    });
+    const base = prev || (sibling ? sibling.s.cols : null);
 
     const sel = {
-      title: prev ? prev.title : (guess(headers, n => /^\s*(article\s+|primary\s+)?title\s*$/i.test(n)) ?? guess(headers, n => /title/i.test(n), isDecisionName)),
-      abs: prev ? prev.abs : (guess(headers, n => /^\s*abstract\s*$/i.test(n)) ?? guess(headers, n => /abstract|summary/i.test(n), isDecisionName)),
-      titleDec: prev ? prev.titleDec : (guess(headers, n => /title/i.test(n) && isDecisionName(n)) ?? 'new'),
-      absDec: prev ? prev.absDec : (guess(headers, n => /abstract/i.test(n) && isDecisionName(n)) ?? 'new'),
+      title: base ? base.title : (guess(headers, n => /^\s*(article\s+|primary\s+)?title\s*$/i.test(n)) ?? guess(headers, n => /title/i.test(n), isDecisionName)),
+      abs: base ? base.abs : (guess(headers, n => /^\s*abstract\s*$/i.test(n)) ?? guess(headers, n => /abstract|summary/i.test(n), isDecisionName)),
+      titleDec: base ? base.titleDec : (guess(headers, n => /title/i.test(n) && isDecisionName(n)) ?? 'new'),
+      absDec: base ? base.absDec : (guess(headers, n => /abstract/i.test(n) && isDecisionName(n)) ?? 'new'),
     };
-    if (prev && ex.newHeaders) {
-      if (ex.newHeaders[prev.titleDec] && !headers.some(h => h.c === prev.titleDec && h.name)) sel.titleDec = 'new';
-      if (ex.newHeaders[prev.absDec] && !headers.some(h => h.c === prev.absDec && h.name)) sel.absDec = 'new';
+    const nh = (ex && ex.newHeaders) || (sibling && sibling.s.newHeaders) || {};
+    if (base) {
+      if (nh[base.titleDec] && !headers.some(h => h.c === base.titleDec && h.name)) sel.titleDec = 'new';
+      if (nh[base.absDec] && !headers.some(h => h.c === base.absDec && h.name)) sel.absDec = 'new';
     }
 
     const opts = (val, allowNew, newLabel) =>
@@ -311,7 +411,7 @@
       headers.map(h => `<option value="${h.c}"${String(val) === String(h.c) ? ' selected' : ''}>${esc(h.label)}</option>`).join('');
 
     app.innerHTML = `<section class="view"><div class="wrap">
-      <div><button class="link" data-act="${ex ? 'project' : 'home'}">${ICON.back} ${ex ? 'Back to project' : 'Projects'}</button></div>
+      <div><button class="link" data-act="project">${ICON.back} ${esc(cur.p.name)}</button></div>
       <div style="display:grid;gap:6px">
         <h1>${ex ? 'Change columns' : 'Match your columns'}</h1>
         <p class="muted small">${esc(draft.fileName)}</p>
@@ -331,7 +431,7 @@
       </div>
       <div class="preview" id="m-preview"></div>
       <p class="error" id="m-err" hidden></p>
-      <div class="row"><button class="btn primary" id="m-go">${ex ? 'Save columns' : 'Create project'}</button></div>
+      <div class="row"><button class="btn primary" id="m-go">${ex ? 'Save columns' : 'Add file to project'}</button></div>
     </div></section>`;
 
     const $ = id => document.getElementById(id);
@@ -347,8 +447,7 @@
       let r = rg.s.r + 1;
       for (; r <= rg.e.r; r++) if (cellText(ws, r, s.title) || cellText(ws, r, s.abs)) break;
       const t = cellText(ws, r, s.title), a = cellText(ws, r, s.abs);
-      const total = rg.e.r - rg.s.r;
-      $('m-preview').innerHTML = `<h2>First record · ${fmt(total)} rows</h2>
+      $('m-preview').innerHTML = `<h2>First record · ${fmt(rg.e.r - rg.s.r)} rows</h2>
         <div class="t">${t ? esc(t) : '<span class="faint">No title in this column</span>'}</div>
         <div class="a">${a ? esc(a) : '<span class="faint">No abstract in this column</span>'}</div>`;
     };
@@ -363,7 +462,6 @@
       if (s.abs == null) return err('Choose the column that holds abstracts.');
       if ([s.titleDec, s.absDec].some(v => v === s.title || v === s.abs)) return err('A decision column can’t be the same as the title or abstract column.');
       if (s.titleDec !== 'new' && s.titleDec === s.absDec) return err('Use different columns for title and abstract decisions.');
-
       const rg = rangeOf(ws);
       let next = rg.e.c + 1;
       const newHeaders = {};
@@ -377,86 +475,100 @@
     const ws = draft.wb.Sheets[draft.sheet];
     const rows = readRows(ws, cols);
     if (!rows.length) { toast('No records found in those columns.'); return; }
-    if (!draft.bytes) draft.bytes = XL.write(draft.wb, { bookType: 'xlsx', type: 'array' });
     const ex = draft.existing;
-    const p = ex ? { ...ex } : {
-      id: uid(), name: baseName(draft.fileName), fileName: draft.fileName, ext: draft.ext,
-      createdAt: Date.now(), decisions: { t: {}, a: {} }, pos: { t: null, a: null }, unsaved: 0, sample: draft.sample,
+    const s = ex ? { ...ex } : {
+      id: uid('S'), projectId: cur.p.id, fileName: draft.fileName, ext: draft.ext,
+      addedAt: Date.now(), decisions: { t: {}, a: {} }, unsaved: 0,
     };
-    if (ex && ex.sheet !== draft.sheet) { p.decisions = { t: {}, a: {} }; p.pos = { t: null, a: null }; }
-    p.sheet = draft.sheet;
-    p.cols = cols;
-    p.newHeaders = newHeaders;
-    p.fingerprint = fingerprint(draft.sheet, rows);
-    mergeFileDecisions(p, rows);
-    p.stats = stats(p, rows);
-    p.updatedAt = Date.now();
-    p.live = !!draft.handle;
-
-    await saveProject(p);
-    await db.put('files', { id: p.id, bytes: draft.bytes, handle: draft.handle || null }).catch(() => {});
-    await loadProjects();
-    cur = { p, wb: draft.wb, ws, rows, handle: draft.handle || null, live: !!draft.handle };
-    if (cur.live) queueLiveSave();
-    renderProject();
-  }
-
-  function mergeFileDecisions(p, rows) {
-    for (const x of rows) {
-      if (x.ft !== undefined && p.decisions.t[x.r] === undefined) p.decisions.t[x.r] = x.ft;
-      if (x.fa !== undefined && p.decisions.a[x.r] === undefined) p.decisions.a[x.r] = x.fa;
+    if (ex && ex.sheet !== draft.sheet) {
+      s.decisions = { t: {}, a: {} };
+      for (const k of ['t', 'a']) if (cur.p.pos[k] && cur.p.pos[k].sid === s.id) cur.p.pos[k] = null;
     }
+    s.sheet = draft.sheet;
+    s.cols = cols;
+    s.newHeaders = newHeaders;
+    s.fingerprint = fingerprint(draft.sheet, rows);
+    mergeFileDecisions(s, rows);
+    s.stats = sourceStats(s, rows);
+    s.updatedAt = Date.now();
+
+    await saveSource(s);
+    if (!ex) {
+      const bytes = draft.bytes || XL.write(draft.wb, { bookType: 'xlsx', type: 'array' });
+      await db.put('files', { id: s.id, bytes, handle: draft.handle || null }).catch(() => {});
+      cur.p.fileIds.push(s.id);
+      cur.srcs.push({ s, wb: draft.wb, rows, handle: draft.handle || null, live: !!draft.handle, reconnect: false });
+    } else {
+      const src = cur.srcs.find(x => x.s.id === s.id);
+      Object.assign(src, { s, wb: draft.wb, rows });
+    }
+    refreshStats();
+    touchProject();
+    await loadProjects();
+    const src = cur.srcs.find(x => x.s.id === s.id);
+    if (src.live) queueLiveSave(src);
+    renderProject();
+    if (!ex) toast(`Added ${s.fileName}`);
   }
 
   /* ------------------------------------------------------------------ open project */
-  async function openProject(id) {
-    const p = projects.find(x => x.id === id);
-    if (!p) return renderHome();
+  async function loadSource(id, askPermission) {
+    const s = await db.get('sources', id).catch(() => null);
     const rec = await db.get('files', id).catch(() => null);
-    if (!rec) { toast('The spreadsheet for this project is missing on this device.', 4000); return; }
-
-    let bytes = rec.bytes, handle = rec.handle || null, live = false;
+    if (!s || !rec) return null;
+    let bytes = rec.bytes, handle = rec.handle || null, live = false, reconnect = false;
     if (handle && canLiveSave) {
       try {
         let perm = await handle.queryPermission({ mode: 'readwrite' });
-        if (perm !== 'granted') perm = await handle.requestPermission({ mode: 'readwrite' });
+        if (perm !== 'granted' && askPermission) perm = await handle.requestPermission({ mode: 'readwrite' });
         if (perm === 'granted') {
           const file = await handle.getFile();
           bytes = await file.arrayBuffer();
           live = true;
           db.put('files', { id, bytes, handle }).catch(() => {});
-        }
-      } catch {
-        toast('Couldn’t reach the original file. Using the copy saved on this device.', 4000);
+        } else reconnect = true;
+      } catch { reconnect = true; }
+    }
+    let wb;
+    try { wb = readWorkbook(bytes); } catch { return null; }
+    if (!wb.Sheets[s.sheet]) return { s, wb, rows: [], handle, live, reconnect, broken: true };
+    const rows = readRows(wb.Sheets[s.sheet], s.cols);
+    mergeFileDecisions(s, rows);
+    return { s, wb, rows, handle, live, reconnect };
+  }
+
+  async function openProject(id) {
+    const p = projects.find(x => x.id === id);
+    if (!p) return renderHome();
+    const srcs = [];
+    let ask = true;
+    for (const fid of p.fileIds || []) {
+      const src = await loadSource(fid, ask);
+      if (src) {
+        srcs.push(src);
+        if (src.reconnect) ask = false; // one permission prompt per click; others get a Reconnect button
       }
     }
-
-    let wb;
-    try { wb = readWorkbook(bytes); } catch { toast('The saved spreadsheet couldn’t be read.'); return; }
-    const ws = wb.Sheets[p.sheet];
-    if (!ws) { toast(`Sheet “${p.sheet}” is no longer in the file. Pick the columns again.`, 4000); renderMap({ fileName: p.fileName, ext: p.ext, bytes, handle, wb, sheet: wb.SheetNames[0], existing: p, sample: p.sample }); return; }
-    const rows = readRows(ws, p.cols);
-    mergeFileDecisions(p, rows);
-    p.stats = stats(p, rows);
-    p.live = live;
-    cur = { p, wb, ws, rows, handle, live };
+    p.fileIds = srcs.map(x => x.s.id);
+    cur = { p, srcs };
+    refreshStats();
+    saveProject(p);
     renderProject();
+    if (srcs.some(x => x.broken)) toast('A sheet is missing from one of the files. Use Change columns on that file.', 4500);
   }
 
   /* ------------------------------------------------------------------ project view */
   function renderProject() {
     view = 'project'; screen = null;
-    const { p, rows } = cur;
-    p.stats = stats(p, rows);
-    const s = p.stats;
+    const { p, srcs } = cur;
+    const s = refreshStats();
+    const multi = srcs.length > 1;
     const stageCard = (k) => {
       const st = s[k];
       const left = st.total - st.done;
       const locked = k === 'a' && st.total === 0;
       const noun = k === 't' ? 'title' : 'abstract';
-      const label = left > 0
-        ? `Screen ${fmt(left)} remaining ${noun}${left === 1 ? '' : 's'}`
-        : `All ${noun}s screened · review`;
+      const label = left > 0 ? `Screen ${fmt(left)} remaining ${noun}${left === 1 ? '' : 's'}` : `All ${noun}s screened · review`;
       return `<div class="stage">
         <h3 class="stage-title">${STAGE_NAME[k]}</h3>
         <div class="big num">${fmt(st.done)}<small> / ${fmt(st.total)} screened</small></div>
@@ -467,37 +579,96 @@
           <span class="cm"><b>${fmt(st[2])}</b>Maybe</span>
           <span><b>${fmt(left)}</b>Left</span>
         </div>
-        ${k === 'a' ? `<p class="small muted">Records included or marked maybe at title stage.</p>` : `<p class="small muted">Every record in the sheet.</p>`}
+        <p class="small muted">${k === 'a' ? 'Records included or marked maybe at title stage.' : multi ? `Every record across ${srcs.length} files.` : 'Every record in the file.'}</p>
         <button class="btn ${locked ? '' : 'primary'}" data-stage="${k}" ${locked ? 'disabled' : ''}>${locked ? 'Include some titles first' : label}</button>
       </div>`;
     };
+    const fileRow = (src) => {
+      const f = src.s, st = f.stats || emptyStats();
+      const status = src.broken ? '<span class="tag exclude">Sheet missing</span>'
+        : src.reconnect ? `<button class="btn small-btn" data-reconnect="${esc(f.id)}">Reconnect file</button>`
+        : src.live ? '<span class="tag include">Live file</span>'
+        : f.unsaved ? `<span class="tag maybe">${fmt(f.unsaved)} not in Excel yet</span>` : '';
+      return `<div class="file" data-file="${esc(f.id)}">
+        <div class="f-head">
+          <span class="f-icon">${ICON.file}</span>
+          <div class="f-name"><b>${esc(f.fileName)}</b><span class="muted small num">${esc(f.sheet)} · ${plural(src.rows.length, 'record')}</span></div>
+          ${status}
+        </div>
+        <div class="p-meta num">
+          <span>${barHTML(st.t)}Titles ${fmt(st.t.done)} / ${fmt(st.t.total)}</span>
+          <span>${barHTML(st.a)}Abstracts ${fmt(st.a.done)} / ${fmt(st.a.total)}</span>
+        </div>
+        <div class="f-actions" data-slot="${esc(f.id)}">
+          ${src.live ? '' : `<button class="link small" data-save-one="${esc(f.id)}">Save Excel</button>`}
+          <button class="link small" data-columns="${esc(f.id)}">Change columns</button>
+          <button class="link small danger-link" data-remove="${esc(f.id)}">Remove</button>
+        </div>
+      </div>`;
+    };
+
     app.innerHTML = `<section class="view"><div class="wrap">
       <div><button class="link" data-act="home">${ICON.back} Projects</button></div>
-      <div style="display:grid;gap:6px">
+      <div style="display:grid;gap:6px" id="title-slot">
         <h1>${esc(p.name)}</h1>
-        <p class="muted small num">${esc(p.fileName)} · ${esc(p.sheet)} · ${fmt(rows.length)} records${p.sample ? ' · <span class="tag">Example data</span>' : ''}</p>
+        <p class="muted small num">${srcs.length ? `${plural(srcs.length, 'file')} · ${plural(s.t.total, 'record')}` : 'No files yet'}${p.sample ? ' · <span class="tag">Example data</span>' : ''}</p>
       </div>
-      <div class="stages">${stageCard('t')}${stageCard('a')}</div>
+      ${srcs.length ? `<div class="stages">${stageCard('t')}${stageCard('a')}</div>` : `
+        <div class="empty">
+          <h3 class="stage-title" style="border:0;padding:0">Add your first file</h3>
+          <p class="note">Add an Excel or CSV export of your search results. You can add more files later, for example one per database, and screen them together.</p>
+          <button class="btn primary" data-act="add">Add Excel file</button>
+        </div>`}
+      ${srcs.length ? `
+        <div class="section">
+          <div class="row" style="justify-content:space-between"><h2>Files</h2><button class="btn" data-act="add">Add file</button></div>
+          <div class="files">${srcs.map(fileRow).join('')}</div>
+        </div>` : ''}
       <div class="row">
-        ${saveButtonHTML('btn')}
-        <button class="btn" data-act="columns">Change columns</button>
+        ${srcs.length ? saveButtonHTML('btn') : ''}
+        <button class="btn" data-act="rename">Rename</button>
         <span id="del-slot"><button class="btn danger" data-act="delete">Delete project</button></span>
       </div>
-      <p class="note">${cur.live
-        ? 'Live file: every decision is written into the Excel file on this computer a moment after you swipe.'
-        : 'Progress is saved on this device after every swipe. <b>Save Excel</b> gives you the spreadsheet with all decisions filled in.'}</p>
+      ${srcs.length ? `<p class="note">${srcs.every(x => x.live)
+        ? 'Live files: every decision is written into the Excel files on this computer a moment after you swipe.'
+        : 'Progress is saved on this device after every swipe. <b>Save Excel</b> gives you the spreadsheets with all decisions filled in.'}</p>` : ''}
     </div></section>`;
   }
 
+  function renderRename() {
+    const slot = document.getElementById('title-slot');
+    slot.innerHTML = `<form class="row" id="rn-form" autocomplete="off">
+      <input id="rn-name" class="text" type="text" maxlength="120" value="${esc(cur.p.name)}" aria-label="Project name" style="flex:1;min-width:200px">
+      <button class="btn primary" type="submit">Save</button>
+      <button class="btn" type="button" data-act="project">Cancel</button>
+    </form>`;
+    const input = document.getElementById('rn-name');
+    input.focus(); input.select();
+    document.getElementById('rn-form').addEventListener('submit', async e => {
+      e.preventDefault();
+      const name = input.value.trim();
+      if (!name) return;
+      cur.p.name = name;
+      touchProject();
+      await loadProjects();
+      renderProject();
+    });
+  }
+
+  /* ------------------------------------------------------------------ saving to Excel */
+  const nonLive = () => cur.srcs.filter(x => !x.live && !x.broken);
   function saveButtonHTML(cls) {
-    const p = cur.p;
-    if (cur.live) {
+    if (!cur.srcs.length) return '';
+    const isBtn = cls === 'btn';
+    const pending = nonLive();
+    if (!pending.length) {
       const st = liveState;
       const text = st === 'saving' ? 'Saving…' : st === 'error' ? 'Not saved · retry' : 'Saved to file';
-      return `<button class="${cls === 'btn' ? 'btn' : 'save'} ${st === 'error' ? 'err' : st === 'saving' ? 'pending' : 'ok'}" data-act="live-retry" id="save-btn">${text}</button>`;
+      return `<button class="${isBtn ? 'btn' : 'save'} ${st === 'error' ? 'err' : st === 'saving' ? 'pending' : 'ok'}" data-act="live-retry" id="save-btn">${text}</button>`;
     }
-    const n = p.unsaved || 0;
-    if (cls === 'btn') return `<button class="btn" data-act="export" id="save-btn">Save Excel${n ? ` · ${fmt(n)} new` : ''}</button>`;
+    const n = pending.reduce((a, x) => a + (x.s.unsaved || 0), 0);
+    const files = pending.length > 1 ? ' files' : '';
+    if (isBtn) return `<button class="btn" data-act="export" id="save-btn">Save Excel${files}${n ? ` · ${fmt(n)} new` : ''}</button>`;
     return `<button class="save ${n ? 'pending' : 'ok'}" data-act="export" id="save-btn">${n ? `Save Excel · ${fmt(n)}` : 'Save Excel'}</button>`;
   }
   function refreshSaveButton() {
@@ -505,82 +676,110 @@
     if (!b || !cur) return;
     const tmp = document.createElement('div');
     tmp.innerHTML = saveButtonHTML(b.classList.contains('btn') ? 'btn' : 'save');
-    b.replaceWith(tmp.firstElementChild);
+    if (tmp.firstElementChild) b.replaceWith(tmp.firstElementChild);
   }
 
-  /* ------------------------------------------------------------------ saving to Excel */
-  let liveTimer = null, liveState = 'ok', liveBusy = false, liveAgain = false;
-  function queueLiveSave() {
-    if (!cur || !cur.live) return;
+  let liveTimer = null, liveState = 'ok', liveBusy = false;
+  const liveDirty = new Set();
+  function queueLiveSave(src) {
+    if (!src || !src.live) return;
+    liveDirty.add(src);
     clearTimeout(liveTimer);
     liveTimer = setTimeout(liveSave, 700);
   }
   async function liveSave() {
-    if (!cur || !cur.live) return;
-    if (liveBusy) { liveAgain = true; return; }
+    if (liveBusy) { clearTimeout(liveTimer); liveTimer = setTimeout(liveSave, 400); return; }
+    if (!liveDirty.size) { refreshSaveButton(); return; }
     liveBusy = true; liveState = 'saving'; refreshSaveButton();
-    const c = cur;
-    try {
-      const { blob } = outputFile(c.p, c.wb);
-      const w = await c.handle.createWritable();
-      await w.write(blob);
-      await w.close();
-      liveState = 'ok';
-      c.p.unsaved = 0;
-      saveProject(c.p);
-      blob.arrayBuffer().then(bytes => db.put('files', { id: c.p.id, bytes, handle: c.handle })).catch(() => {});
-    } catch (e) {
-      liveState = 'error';
-      toast(e && e.name === 'NoModificationAllowedError'
-        ? 'The file is locked by another app. Close it there and tap “retry”.'
-        : 'Couldn’t write to the Excel file. Your progress is still saved here.', 5000);
+    const batch = [...liveDirty]; liveDirty.clear();
+    let failed = false;
+    for (const src of batch) {
+      try {
+        const { blob } = outputFile(src);
+        const w = await src.handle.createWritable();
+        await w.write(blob);
+        await w.close();
+        src.s.unsaved = 0;
+        saveSource(src.s);
+        blob.arrayBuffer().then(bytes => db.put('files', { id: src.s.id, bytes, handle: src.handle })).catch(() => {});
+      } catch (e) {
+        failed = true;
+        liveDirty.add(src);
+        toast(e && e.name === 'NoModificationAllowedError'
+          ? `${src.s.fileName} is locked by another app. Close it there and tap “retry”.`
+          : `Couldn’t write to ${src.s.fileName}. Your progress is still saved here.`, 5000);
+      }
     }
+    liveState = failed ? 'error' : 'ok';
     liveBusy = false;
     refreshSaveButton();
-    if (liveAgain) { liveAgain = false; queueLiveSave(); }
+  }
+  function retryLive() {
+    if (!cur) return;
+    cur.srcs.filter(x => x.live).forEach(x => liveDirty.add(x));
+    liveSave();
   }
 
-  async function exportExcel() {
-    if (!cur) return;
-    const { p, wb } = cur;
-    let file;
-    try { file = outputFile(p, wb); } catch { toast('Couldn’t build the spreadsheet.'); return; }
-    const done = () => { p.unsaved = 0; p.exportedAt = Date.now(); saveProject(p); refreshSaveButton(); };
-
-    // Phones: the share sheet lets you "Save to Files" / Drive / email.
+  async function exportFiles(targets) {
+    if (!targets.length) return;
+    let files;
+    try { files = targets.map(src => ({ src, ...outputFile(src) })); } catch { toast('Couldn’t build the spreadsheet.'); return; }
+    const done = () => {
+      for (const f of files) { f.src.s.unsaved = 0; f.src.s.exportedAt = Date.now(); saveSource(f.src.s); }
+      refreshSaveButton();
+      if (view === 'project') renderProject();
+    };
+    // Phones: the share sheet lets you "Save to Files" / Drive / email, all files at once.
     if (isTouch && navigator.canShare) {
-      const f = new File([file.blob], file.name, { type: file.blob.type });
-      if (navigator.canShare({ files: [f] })) {
-        try { await navigator.share({ files: [f] }); done(); toast('Saved'); return; }
+      const list = files.map(f => new File([f.blob], f.name, { type: f.blob.type }));
+      if (navigator.canShare({ files: list })) {
+        try { await navigator.share({ files: list }); done(); toast('Saved'); return; }
         catch (e) { if (e && e.name === 'AbortError') return; }
       }
     }
-    const url = URL.createObjectURL(file.blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = file.name;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    files.forEach((f, i) => setTimeout(() => {
+      const url = URL.createObjectURL(f.blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = f.name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+    }, i * 400));
     done();
-    toast(`Downloaded ${file.name}`);
+    toast(files.length > 1 ? `Downloaded ${files.length} files` : `Downloaded ${files[0].name}`);
+  }
+  function exportAll() {
+    const pending = nonLive();
+    const changed = pending.filter(x => x.s.unsaved);
+    return exportFiles(changed.length ? changed : pending);
   }
 
   /* ------------------------------------------------------------------ screening */
+  const decOf = (stage, item) => cur.srcs[item.k].s.decisions[stage][item.x.r];
   function buildQueue(stage) {
-    const d = cur.p.decisions;
-    return stage === 't' ? cur.rows : cur.rows.filter(x => d.t[x.r] === INCLUDE || d.t[x.r] === MAYBE);
+    const q = [];
+    cur.srcs.forEach((src, k) => {
+      if (src.broken) return;
+      const d = src.s.decisions;
+      for (const x of src.rows) if (stage === 't' || d.t[x.r] === INCLUDE || d.t[x.r] === MAYBE) q.push({ k, x });
+    });
+    return q;
   }
   function nextUndecided(from) {
     const { queue, stage } = screen;
-    const d = cur.p.decisions[stage];
-    for (let i = from; i < queue.length; i++) if (d[queue[i].r] === undefined) return i;
-    for (let i = 0; i < Math.min(from, queue.length); i++) if (d[queue[i].r] === undefined) return i;
+    for (let i = from; i < queue.length; i++) if (decOf(stage, queue[i]) === undefined) return i;
+    for (let i = 0; i < Math.min(from, queue.length); i++) if (decOf(stage, queue[i]) === undefined) return i;
     return queue.length;
+  }
+  function posOf(i) {
+    const { queue } = screen;
+    if (i >= queue.length) return -1;
+    return { sid: cur.srcs[queue[i].k].s.id, r: queue[i].x.r };
   }
   function startStage(stage) {
     const queue = buildQueue(stage);
     screen = { stage, queue, qi: 0, busy: false };
     const pos = cur.p.pos[stage];
-    let qi = pos == null || pos === -1 ? -1 : queue.findIndex(x => x.r === pos);
+    let qi = !pos || pos === -1 ? -1 : queue.findIndex(it => cur.srcs[it.k].s.id === pos.sid && it.x.r === pos.r);
     if (qi < 0) qi = nextUndecided(0);
     screen.qi = qi;
     renderScreen();
@@ -619,22 +818,22 @@
 
   function updateHeader() {
     const { stage, queue, qi } = screen;
-    const st = stats(cur.p, cur.rows)[stage];
-    cur.p.stats = stats(cur.p, cur.rows);
-    const pos = Math.min(qi + 1, queue.length);
+    const st = refreshStats()[stage];
     document.getElementById('s-count').textContent = qi < queue.length
-      ? `Record ${fmt(pos)} of ${fmt(queue.length)} · ${fmt(st.done)} screened`
+      ? `Record ${fmt(qi + 1)} of ${fmt(queue.length)} · ${fmt(st.done)} screened`
       : `${fmt(st.done)} of ${fmt(queue.length)} screened`;
     document.getElementById('s-bar').innerHTML = barHTML(st);
   }
 
-  function cardHTML(x, idx, under) {
+  function cardHTML(item, idx, under) {
     const { stage, queue } = screen;
-    const v = cur.p.decisions[stage][x.r];
+    const x = item.x;
+    const v = decOf(stage, item);
     const isAbs = stage === 'a';
     const chip = v !== undefined ? `<span class="tag ${CLS[v]}">${LABEL[v]}</span>` : '';
+    const where = cur.srcs.length > 1 ? `${esc(cur.srcs[item.k].s.fileName)} · row ${fmt(x.r + 1)}` : `Excel row ${fmt(x.r + 1)}`;
     return `<article class="card ${isAbs ? 'abs' : ''} ${under ? 'under' : ''}" ${under ? 'aria-hidden="true"' : ''}>
-      <div class="meta num"><span>${fmt(idx + 1)} / ${fmt(queue.length)} · Excel row ${fmt(x.r + 1)}</span>${chip}</div>
+      <div class="meta num"><span class="where">${fmt(idx + 1)} / ${fmt(queue.length)} · ${where}</span>${chip}</div>
       <div class="body">
         <div class="inner ${isAbs ? 'top' : ''}">
           <div class="ttl">${x.t ? esc(x.t) : '<span class="faint">No title</span>'}</div>
@@ -648,35 +847,33 @@
 
   function renderDeck(animateIn) {
     const deck = document.getElementById('deck');
-    const { queue, qi } = screen;
+    const { queue, qi, stage } = screen;
     updateHeader();
     const controls = document.getElementById('controls');
     const hints = document.getElementById('hints');
     if (qi >= queue.length) {
-      const st = stats(cur.p, cur.rows)[screen.stage];
+      const st = cur.p.stats[stage];
       const left = queue.length - st.done;
+      const allLive = !nonLive().length;
       deck.innerHTML = `<div class="done"><div>
         <h1>${left ? `${fmt(left)} records still unscreened` : `All ${fmt(queue.length)} records screened`}</h1>
         <p class="muted num">${fmt(st[1])} included · ${fmt(st[0])} excluded · ${fmt(st[2])} maybe</p>
         <div class="row" style="justify-content:center">
-          ${cur.live ? '' : `<button class="btn primary" data-act="export">Save Excel</button>`}
-          ${screen.stage === 't' && st[1] + st[2] > 0 ? `<button class="btn${cur.live ? ' primary' : ''}" data-stage="a">Start abstract screening</button>` : ''}
+          ${allLive ? '' : `<button class="btn primary" data-act="export">Save Excel</button>`}
+          ${stage === 't' && st[1] + st[2] > 0 ? `<button class="btn${allLive ? ' primary' : ''}" data-stage="a">Start abstract screening</button>` : ''}
           <button class="btn" data-act="review">Review from the start</button>
         </div>
       </div></div>`;
       controls.querySelectorAll('[data-dec]').forEach(b => { b.disabled = true; });
       hints.hidden = true;
-      cur.p.pos[screen.stage] = -1;
+      cur.p.pos[stage] = -1;
       saveProject(cur.p);
       return;
     }
     controls.querySelectorAll('[data-dec]').forEach(b => { b.disabled = false; });
     hints.hidden = false;
-    const nextIdx = (() => {
-      const d = cur.p.decisions[screen.stage];
-      for (let i = qi + 1; i < queue.length; i++) if (d[queue[i].r] === undefined) return i;
-      return -1;
-    })();
+    let nextIdx = -1;
+    for (let i = qi + 1; i < queue.length; i++) if (decOf(stage, queue[i]) === undefined) { nextIdx = i; break; }
     deck.innerHTML = (nextIdx >= 0 ? cardHTML(queue[nextIdx], nextIdx, true) : '') + cardHTML(queue[qi], qi, false);
     const card = deck.querySelector('.card:not(.under)');
     if (animateIn) {
@@ -684,34 +881,35 @@
       requestAnimationFrame(() => { card.classList.remove('dragging'); requestAnimationFrame(() => card.classList.remove('enter')); });
     }
     attachGestures(card);
-    cur.p.pos[screen.stage] = queue[qi].r;
+    cur.p.pos[stage] = posOf(qi);
   }
 
   function decide(v) {
     const { stage, queue, qi } = screen;
-    const x = queue[qi];
-    const prev = cur.p.decisions[stage][x.r];
-    cur.p.decisions[stage][x.r] = v;
-    if (prev !== v) cur.p.unsaved = (cur.p.unsaved || 0) + 1;
-    cur.p.updatedAt = Date.now();
+    const item = queue[qi];
+    const src = cur.srcs[item.k];
+    const prev = src.s.decisions[stage][item.x.r];
+    src.s.decisions[stage][item.x.r] = v;
+    if (prev !== v) src.s.unsaved = (src.s.unsaved || 0) + 1;
+    src.s.updatedAt = Date.now();
     screen.qi = nextUndecided(qi + 1);
-    cur.p.pos[stage] = screen.qi < queue.length ? queue[screen.qi].r : -1;
-    cur.p.stats = stats(cur.p, cur.rows);
-    saveProject(cur.p);
-    if (cur.live) queueLiveSave();
+    cur.p.pos[stage] = posOf(screen.qi);
+    refreshStats();
+    saveSource(src.s);
+    touchProject();
+    if (src.live) queueLiveSave(src);
     renderDeck(true);
     const s = document.getElementById('s-save');
     if (s) s.innerHTML = saveButtonHTML('save');
   }
 
   function flyOut(v, card) {
-    if (screen.busy || screen.qi >= screen.queue.length) return;
+    if (!screen || screen.busy || screen.qi >= screen.queue.length) return;
     card = card || document.querySelector('#deck .card:not(.under)');
     if (!card) return;
     screen.busy = true;
     const W = window.innerWidth, H = window.innerHeight;
-    const cur_t = card.style.transform || '';
-    const m = /translate\(([-\d.]+)px,\s*([-\d.]+)px\)/.exec(cur_t);
+    const m = /translate\(([-\d.]+)px,\s*([-\d.]+)px\)/.exec(card.style.transform || '');
     const y0 = m ? +m[2] : 0;
     card.classList.remove('dragging');
     const show = cls => { const s = card.querySelector(cls); if (s) s.style.opacity = 1; };
@@ -835,33 +1033,68 @@
   });
 
   /* ------------------------------------------------------------------ actions */
+  const srcById = id => cur && cur.srcs.find(x => x.s.id === id);
+
   app.addEventListener('click', async e => {
-    const t = e.target.closest('[data-act], [data-open], [data-stage], [data-dec]');
+    const t = e.target.closest('[data-act], [data-open], [data-stage], [data-dec], [data-columns], [data-remove], [data-remove-yes], [data-save-one], [data-reconnect]');
     if (!t || t.disabled) return;
-    if (t.dataset.open) return openProject(t.dataset.open);
-    if (t.dataset.stage) return startStage(t.dataset.stage);
-    if (t.dataset.dec) return flyOut(+t.dataset.dec);
-    switch (t.dataset.act) {
+    const d = t.dataset;
+    if (d.open) return openProject(d.open);
+    if (d.stage) return startStage(d.stage);
+    if (d.dec) return flyOut(+d.dec);
+    if (d.saveOne) { const src = srcById(d.saveOne); return src && exportFiles([src]); }
+    if (d.columns) {
+      const src = srcById(d.columns);
+      if (!src) return;
+      return renderMap({ fileName: src.s.fileName, ext: src.s.ext, bytes: null, handle: src.handle, wb: src.wb, sheet: src.wb.Sheets[src.s.sheet] ? src.s.sheet : src.wb.SheetNames[0], existing: src.s });
+    }
+    if (d.reconnect) {
+      const src = srcById(d.reconnect);
+      if (!src) return;
+      const fresh = await loadSource(src.s.id, true);
+      if (fresh && fresh.live) { Object.assign(src, fresh); queueLiveSave(src); toast('Reconnected'); }
+      else toast('Sift still can’t edit that file. Allow access when Chrome asks.', 4000);
+      return renderProject();
+    }
+    if (d.remove) {
+      const slot = app.querySelector(`[data-slot="${CSS.escape(d.remove)}"]`);
+      slot.innerHTML = `<span class="small muted">Remove this file and its decisions from the project? The Excel file itself isn’t touched.</span>
+        <button class="link small danger-link" data-remove-yes="${esc(d.remove)}">Remove</button>
+        <button class="link small" data-act="project">Cancel</button>`;
+      return;
+    }
+    if (d.removeYes) {
+      const id = d.removeYes;
+      await db.del('sources', id).catch(() => {});
+      await db.del('files', id).catch(() => {});
+      cur.srcs = cur.srcs.filter(x => x.s.id !== id);
+      cur.p.fileIds = cur.p.fileIds.filter(x => x !== id);
+      for (const k of ['t', 'a']) if (cur.p.pos[k] && cur.p.pos[k].sid === id) cur.p.pos[k] = null;
+      refreshStats();
+      touchProject();
+      await loadProjects();
+      toast('File removed');
+      return renderProject();
+    }
+    switch (d.act) {
       case 'home': await loadProjects(); return renderHome();
-      case 'new': return pickFile();
+      case 'new': return renderNewProject();
+      case 'add': return pickFile();
       case 'sample': return createSample();
       case 'project': return cur ? renderProject() : renderHome();
-      case 'export': return exportExcel();
-      case 'live-retry': return liveSave();
+      case 'export': return exportAll();
+      case 'live-retry': return retryLive();
       case 'undo': return goBack();
+      case 'rename': return renderRename();
       case 'resume': screen.qi = nextUndecided(screen.qi); return renderDeck(false);
       case 'review': screen.qi = 0; return renderDeck(false);
-      case 'columns': {
-        const rec = await db.get('files', cur.p.id).catch(() => null);
-        return renderMap({ fileName: cur.p.fileName, ext: cur.p.ext, bytes: rec ? rec.bytes : null, handle: cur.handle, wb: cur.wb, sheet: cur.p.sheet, existing: cur.p, sample: cur.p.sample });
-      }
       case 'delete':
-        document.getElementById('del-slot').innerHTML = `<span class="confirm"><span class="small muted">Delete from this device? Your Excel file is not touched.</span>
+        document.getElementById('del-slot').innerHTML = `<span class="confirm"><span class="small muted">Delete this project from this device? Your Excel files aren’t touched.</span>
           <button class="btn danger" data-act="delete-yes">Delete</button><button class="btn" data-act="project">Cancel</button></span>`;
         return;
       case 'delete-yes':
+        for (const id of cur.p.fileIds) { await db.del('sources', id).catch(() => {}); await db.del('files', id).catch(() => {}); }
         await db.del('projects', cur.p.id).catch(() => {});
-        await db.del('files', cur.p.id).catch(() => {});
         await loadProjects();
         toast('Project deleted');
         return renderHome();
@@ -869,7 +1102,7 @@
   });
 
   /* ------------------------------------------------------------------ example project */
-  function createSample() {
+  async function createSample() {
     const rows = [
       ['ID', 'Title', 'Abstract', 'Authors', 'Year'],
       [1, 'Effect of an eight-week mindfulness programme on burnout in intensive care nurses: a randomised controlled trial',
@@ -898,15 +1131,16 @@
     const wb = XL.utils.book_new();
     XL.utils.book_append_sheet(wb, ws, 'Records');
     const bytes = XL.write(wb, { bookType: 'xlsx', type: 'array' });
-    const wb2 = readWorkbook(bytes);
-    renderMap({ fileName: 'Example records - mindfulness and burnout.xlsx', ext: 'xlsx', bytes, handle: null, wb: wb2, sheet: 'Records', existing: null, sample: true });
+    const p = await createProject('Example review: mindfulness and burnout', true);
+    cur = { p, srcs: [] };
+    renderMap({ fileName: 'Example records.xlsx', ext: 'xlsx', bytes, handle: null, wb: readWorkbook(bytes), sheet: 'Records', existing: null });
   }
 
   /* ------------------------------------------------------------------ boot */
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden' && cur) {
       saveProject(cur.p);
-      if (cur.live && liveTimer) { clearTimeout(liveTimer); liveSave(); }
+      if (liveDirty.size) { clearTimeout(liveTimer); liveSave(); }
     }
   });
 
