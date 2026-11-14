@@ -35,6 +35,10 @@ function cors(origin: string | null): Record<string, string> {
     "Vary": "Origin",
   };
 }
+// Never let a key reach the logs, whatever an error message contains.
+const redact = (v: unknown) => String(v).replace(/sk-ant-[A-Za-z0-9_\-\s]+/g, "sk-ant-[redacted]").slice(0, 300);
+const apiKey = () => (Deno.env.get("ANTHROPIC_API_KEY") || "").replace(/\s+/g, "");
+
 function reply(status: number, body: unknown, origin: string | null) {
   return new Response(JSON.stringify(body), {
     status,
@@ -98,7 +102,7 @@ Deno.serve(async (req: Request) => {
   try { columns = cleanColumns(JSON.parse(text)); } catch { columns = null; }
   if (!columns) return reply(400, { error: "Send the spreadsheet's columns." }, origin);
 
-  if (!Deno.env.get("ANTHROPIC_API_KEY")) {
+  if (!apiKey()) {
     console.error("ANTHROPIC_API_KEY secret is not set");
     return reply(503, { error: "The column finder isn’t set up yet. Pick the columns yourself for now." }, origin);
   }
@@ -106,7 +110,7 @@ Deno.serve(async (req: Request) => {
   const listing = columns.map((c, i) => ({ position: i, header: c.name || "(no header)", samples: c.samples }));
 
   try {
-    const client = new Anthropic(); // reads ANTHROPIC_API_KEY from the function's secrets
+    const client = new Anthropic({ apiKey: apiKey() }); // key comes from the function's secrets, whitespace removed
     const response = await client.messages.parse({
       model: "claude-haiku-5-5",
       max_tokens: 4000,
@@ -130,10 +134,10 @@ Deno.serve(async (req: Request) => {
     if (e instanceof Anthropic.RateLimitError) return reply(429, { error: "Claude is busy. Try again in a moment." }, origin);
     if (e instanceof Anthropic.APIConnectionError) return reply(502, { error: "Couldn’t reach Claude. Try again." }, origin);
     if (e instanceof Anthropic.APIError) {
-      console.error("Claude API error", e.status, e.message);
+      console.error("Claude API error", e.status, redact(e.message));
       return reply(502, { error: "Claude couldn’t answer just now. Try again." }, origin);
     }
-    console.error(e);
+    console.error("Unexpected error", e instanceof Error ? e.name : typeof e, redact(e instanceof Error ? e.message : e));
     return reply(500, { error: "Something went wrong. Pick the columns yourself for now." }, origin);
   }
 });
