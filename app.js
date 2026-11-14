@@ -133,6 +133,8 @@
     q: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 9a3 3 0 115 2.2c-1.2.8-2 1.4-2 2.8"/><path d="M12 18h.01"/></svg>',
     chev: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>',
     magic: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20L15 9"/><path d="M13.5 7.5l3 3"/><path d="M18 2.5v3M16.5 4h3"/><path d="M20.5 9v2M19.5 10h2"/><path d="M9 3v2M8 4h2"/></svg>',
+    criteria: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11M9 12h11M9 18h11"/><path d="M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"/></svg>',
+    close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
     file: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M9 12h6M9 16h6"/></svg>',
   };
 
@@ -315,6 +317,7 @@
           <input id="np-name" class="text" type="text" maxlength="120" placeholder="e.g. Exercise for knee osteoarthritis" required>
           <span class="hint">You can add several files to a project, such as one export per database.</span>
         </div>
+        ${criteriaFieldsHTML('np', { inc: '', exc: '' })}
         <div class="row"><button class="btn primary" id="np-go" type="submit" disabled>Create project</button></div>
       </form>
     </div></section>`;
@@ -325,17 +328,77 @@
       e.preventDefault();
       const name = input.value.trim();
       if (!name) return;
-      const p = await createProject(name, false);
+      const p = await createProject(name, false, readCriteria('np'));
       cur = { p, srcs: [] };
       renderProject();
     });
     setTimeout(() => input.focus(), 50);
   }
-  async function createProject(name, sample) {
-    const p = { id: uid('P'), name, fileIds: [], pos: { t: null, a: null }, sample, createdAt: Date.now(), updatedAt: Date.now(), stats: emptyStats() };
+  async function createProject(name, sample, criteria) {
+    const p = { id: uid('P'), name, fileIds: [], pos: { t: null, a: null }, sample, criteria: criteria || { inc: '', exc: '' },
+      showCriteria: false, createdAt: Date.now(), updatedAt: Date.now(), stats: emptyStats() };
     await saveProject(p);
     await loadProjects();
     return p;
+  }
+
+  /* ------------------------------------------------------------------ eligibility criteria */
+  const hasCriteria = p => !!(p.criteria && (p.criteria.inc.trim() || p.criteria.exc.trim()));
+  function criteriaFieldsHTML(prefix, c) {
+    return `<div class="field">
+        <label for="${prefix}-inc">Inclusion criteria <span class="faint">(optional)</span></label>
+        <textarea id="${prefix}-inc" class="text area" rows="5" placeholder="e.g. Adults with knee osteoarthritis&#10;Any exercise-based intervention&#10;Randomised controlled trials">${esc(c.inc)}</textarea>
+      </div>
+      <div class="field">
+        <label for="${prefix}-exc">Exclusion criteria <span class="faint">(optional)</span></label>
+        <textarea id="${prefix}-exc" class="text area" rows="4" placeholder="e.g. Post-surgical rehabilitation&#10;Conference abstracts">${esc(c.exc)}</textarea>
+        <span class="hint">You can pull these up beside each record while you screen.</span>
+      </div>`;
+  }
+  const readCriteria = prefix => ({
+    inc: document.getElementById(prefix + '-inc').value.trim(),
+    exc: document.getElementById(prefix + '-exc').value.trim(),
+  });
+  function criteriaBlocksHTML(c) {
+    const block = (cls, title, text) => text ? `<div class="crit-block ${cls}"><h4>${title}</h4><p>${esc(text)}</p></div>` : '';
+    return block('inc', 'Include', c.inc) + block('exc', 'Exclude', c.exc);
+  }
+  function criteriaSectionHTML(p) {
+    return `<div class="section" id="crit-section">
+      <div class="row" style="justify-content:space-between"><h2>Eligibility criteria</h2>
+        <button class="btn" data-act="edit-criteria">${hasCriteria(p) ? 'Edit criteria' : 'Add criteria'}</button></div>
+      ${hasCriteria(p) ? `<div class="crit-preview">${criteriaBlocksHTML(p.criteria)}</div>`
+        : '<p class="note">No criteria yet. Add your inclusion and exclusion criteria so you can check them while you screen.</p>'}
+    </div>`;
+  }
+  function renderEditCriteria() {
+    const slot = document.getElementById('crit-section');
+    slot.innerHTML = `<h2>Eligibility criteria</h2>
+      <form class="fields" id="cr-form" autocomplete="off">
+        ${criteriaFieldsHTML('cr', cur.p.criteria || { inc: '', exc: '' })}
+        <div class="row"><button class="btn primary" type="submit">Save criteria</button><button class="btn" type="button" data-act="project">Cancel</button></div>
+      </form>`;
+    document.getElementById('cr-inc').focus();
+    document.getElementById('cr-form').addEventListener('submit', async e => {
+      e.preventDefault();
+      cur.p.criteria = readCriteria('cr');
+      touchProject();
+      await loadProjects();
+      toast('Criteria saved');
+      renderProject();
+    });
+  }
+  function toggleCriteria(force) {
+    if (!cur || !screen) return;
+    const show = typeof force === 'boolean' ? force : !cur.p.showCriteria;
+    cur.p.showCriteria = show;
+    saveProject(cur.p);
+    const panel = document.getElementById('crit');
+    const main = document.getElementById('screen-main');
+    const btn = document.getElementById('crit-btn');
+    if (panel) panel.hidden = !show;
+    if (main) main.classList.toggle('with-crit', show);
+    if (btn) btn.setAttribute('aria-pressed', String(show));
   }
 
   /* ------------------------------------------------------------------ adding files */
@@ -691,6 +754,7 @@
           <p class="note">Add an Excel or CSV export of your search results. You can add more files later, for example one per database, and screen them together.</p>
           <button class="btn primary" data-act="add">Add Excel file</button>
         </div>`}
+      ${criteriaSectionHTML(p)}
       ${srcs.length ? `
         <div class="section">
           <div class="row" style="justify-content:space-between"><h2>Files</h2><button class="btn" data-act="add">Add file</button></div>
@@ -867,17 +931,25 @@
         <span id="s-save">${saveButtonHTML('save')}</span>
       </div>
       <div class="progress" id="s-bar"></div>
-      <div class="deck" id="deck"></div>
+      <div class="screen-main${cur.p.showCriteria ? ' with-crit' : ''}" id="screen-main">
+        <div class="deck" id="deck"></div>
+        <aside class="crit" id="crit" aria-label="Eligibility criteria"${cur.p.showCriteria ? '' : ' hidden'}>
+          <div class="crit-head"><h3>Eligibility criteria</h3>
+            <button class="crit-x" data-act="criteria-close" aria-label="Hide criteria">${ICON.close}</button></div>
+          <div class="crit-body" tabindex="0">${hasCriteria(cur.p) ? criteriaBlocksHTML(cur.p.criteria)
+            : '<p class="muted small">No criteria for this project yet.</p><button class="link small" data-act="criteria-add">Add criteria</button>'}</div>
+        </aside>
+      </div>
       <div class="controls" id="controls">
         <button class="circle back" data-act="undo" aria-label="Previous record">${ICON.undo}</button>
         <button class="circle no" data-dec="0" aria-label="Exclude">${ICON.x}</button>
         <button class="circle may" data-dec="2" aria-label="Maybe">${ICON.q}</button>
         <button class="circle yes" data-dec="1" aria-label="Include">${ICON.check}</button>
-        <span class="spacer40" aria-hidden="true"></span>
+        <button class="circle back crit-toggle" id="crit-btn" data-act="criteria" aria-label="Show eligibility criteria" aria-pressed="${!!cur.p.showCriteria}" title="Criteria (C)">${ICON.criteria}</button>
       </div>
       <div class="hints" id="hints">${isTouch
         ? 'Swipe right to include · left to exclude · up for maybe'
-        : '→ include · ← exclude · ↑ maybe · Backspace for previous'}</div>
+        : '→ include · ← exclude · ↑ maybe · Backspace for previous · C for criteria'}</div>
     </section>`;
     if (!queue.length) {
       document.getElementById('deck').innerHTML = `<div class="done"><div><h1>No records here yet</h1><p class="muted">Include titles first, then come back for abstracts.</p><button class="btn" data-act="project">Back to project</button></div></div>`;
@@ -1097,6 +1169,7 @@
     else if (k === 'ArrowLeft') { e.preventDefault(); flyOut(EXCLUDE); }
     else if (k === 'ArrowUp') { e.preventDefault(); flyOut(MAYBE); }
     else if (k === 'Backspace' || k === 'z' || k === 'Z') { e.preventDefault(); goBack(); }
+    else if (k === 'c' || k === 'C') { e.preventDefault(); toggleCriteria(); }
     else if (k === 'Escape') { e.preventDefault(); renderProject(); }
     else if (k === 'ArrowDown' || k === ' ') {
       const b = document.querySelector('#deck .card:not(.under) .body');
@@ -1158,6 +1231,10 @@
       case 'live-retry': return retryLive();
       case 'undo': return goBack();
       case 'rename': return renderRename();
+      case 'edit-criteria': return renderEditCriteria();
+      case 'criteria': return toggleCriteria();
+      case 'criteria-close': return toggleCriteria(false);
+      case 'criteria-add': renderProject(); return renderEditCriteria();
       case 'resume': screen.qi = nextUndecided(screen.qi); return renderDeck(false);
       case 'review': screen.qi = 0; return renderDeck(false);
       case 'delete':
@@ -1203,7 +1280,10 @@
     const wb = XL.utils.book_new();
     XL.utils.book_append_sheet(wb, ws, 'Records');
     const bytes = XL.write(wb, { bookType: 'xlsx', type: 'array' });
-    const p = await createProject('Example review: mindfulness and burnout', true);
+    const p = await createProject('Example review: mindfulness and burnout', true, {
+      inc: 'Population: practising healthcare workers (doctors, nurses, allied health, support staff)\nIntervention: mindfulness-based programme of any length or format\nComparator: any (usual care, waiting list, active control)\nOutcome: burnout measured with a validated scale (e.g. Maslach Burnout Inventory)\nStudy design: randomised controlled trials, including cluster and pilot RCTs',
+      exc: 'Students not yet in practice\nYoga, exercise or peer support without a mindfulness component\nStudies that do not measure burnout\nQualitative studies, reviews, editorials and conference abstracts',
+    });
     cur = { p, srcs: [] };
     renderMap({ fileName: 'Example records.xlsx', ext: 'xlsx', bytes, handle: null, wb: readWorkbook(bytes), sheet: 'Records', existing: null });
   }
