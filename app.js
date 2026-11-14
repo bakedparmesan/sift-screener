@@ -215,7 +215,7 @@
     }).join('');
 
     app.innerHTML = `<section class="view"><div class="wrap">
-      <div class="brand"><b>Sift</b><span>Systematic review screening</span></div>
+      <div class="brand"><b>Sift</b><span>Swipe to screen</span></div>
       ${projects.length ? `
         <div class="row" style="justify-content:space-between">
           <h2>Projects</h2>
@@ -453,9 +453,12 @@
       const st = s[k];
       const left = st.total - st.done;
       const locked = k === 'a' && st.total === 0;
-      const verb = st.done === 0 ? 'Start' : left === 0 ? 'Review' : 'Continue';
+      const noun = k === 't' ? 'title' : 'abstract';
+      const label = left > 0
+        ? `Screen ${fmt(left)} remaining ${noun}${left === 1 ? '' : 's'}`
+        : `All ${noun}s screened · review`;
       return `<div class="stage">
-        <h2>${STAGE_NAME[k]}</h2>
+        <h3 class="stage-title">${STAGE_NAME[k]}</h3>
         <div class="big num">${fmt(st.done)}<small> / ${fmt(st.total)} screened</small></div>
         ${barHTML(st)}
         <div class="tally num">
@@ -465,7 +468,7 @@
           <span><b>${fmt(left)}</b>Left</span>
         </div>
         ${k === 'a' ? `<p class="small muted">Records included or marked maybe at title stage.</p>` : `<p class="small muted">Every record in the sheet.</p>`}
-        <button class="btn ${locked ? '' : 'primary'}" data-stage="${k}" ${locked ? 'disabled' : ''}>${locked ? 'Include some titles first' : verb}</button>
+        <button class="btn ${locked ? '' : 'primary'}" data-stage="${k}" ${locked ? 'disabled' : ''}>${locked ? 'Include some titles first' : label}</button>
       </div>`;
     };
     app.innerHTML = `<section class="view"><div class="wrap">

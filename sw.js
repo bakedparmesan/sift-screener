@@ -1,5 +1,5 @@
 // Offline support: serve the app shell from cache, refresh it from the network when online.
-const CACHE = 'sift-v1';
+const CACHE = 'sift-v2';
 const SHELL = ['./', 'index.html', 'style.css', 'app.js', 'vendor/xlsx.full.min.js', 'manifest.webmanifest', 'icon.svg', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', e => {
