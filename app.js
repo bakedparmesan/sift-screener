@@ -17,6 +17,11 @@
   const STAGE_NAME = { t: 'Title screening', a: 'Abstract screening' };
   const DEFAULT_HEADER = { t: 'Title screening', a: 'Abstract screening' };
 
+  // Column finder: a Supabase Edge Function that holds the Claude key server-side.
+  // These two values are public by design (they identify the project, they grant nothing secret).
+  const AI_URL = 'https://cmerdamunvelqipstkbx.supabase.co/functions/v1/identify-columns';
+  const AI_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNtZXJkYW11bnZlbHFpcHN0a2J4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQ2ODM2NzAsImV4cCI6MjExMDI1OTY3MH0.KSksFl1TzAEC0OVUKi1xkJJgRj_LhNYJZE80Rnn_Sm0';
+
   const canLiveSave = typeof window.showOpenFilePicker === 'function' && (() => {
     try { return window.top === window.self; } catch { return false; }
   })();
@@ -127,6 +132,7 @@
     check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
     q: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 9a3 3 0 115 2.2c-1.2.8-2 1.4-2 2.8"/><path d="M12 18h.01"/></svg>',
     chev: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>',
+    magic: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20L15 9"/><path d="M13.5 7.5l3 3"/><path d="M18 2.5v3M16.5 4h3"/><path d="M20.5 9v2M19.5 10h2"/><path d="M9 3v2M8 4h2"/></svg>',
     file: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/><path d="M9 12h6M9 16h6"/></svg>',
   };
 
@@ -416,6 +422,10 @@
         <h1>${ex ? 'Change columns' : 'Match your columns'}</h1>
         <p class="muted small">${esc(draft.fileName)}</p>
       </div>
+      <div class="ai-row">
+        <button class="btn magic" id="m-ai" type="button">${ICON.magic}<span>Identify the columns for me</span></button>
+        <p class="ai-note" id="m-ai-note" hidden></p>
+      </div>
       <div class="fields">
         ${draft.wb.SheetNames.length > 1 ? `<div class="field"><label for="m-sheet">Sheet</label>
           <select id="m-sheet">${draft.wb.SheetNames.map(n => `<option${n === draft.sheet ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select></div>` : ''}
@@ -455,6 +465,41 @@
     ['m-title', 'm-abs', 'm-tdec', 'm-adec'].forEach(id => $(id).addEventListener('change', preview));
     if ($('m-sheet')) $('m-sheet').addEventListener('change', e => renderMap({ ...draft, sheet: e.target.value }));
 
+    $('m-ai').addEventListener('click', async () => {
+      const btn = $('m-ai'), note = $('m-ai-note');
+      btn.disabled = true;
+      btn.classList.add('busy');
+      btn.querySelector('span').textContent = 'Reading your file…';
+      note.hidden = true;
+      $('m-err').hidden = true;
+      try {
+        const pick = await identifyColumns(ws, headers);
+        const setSel = (id, pos, allowNew) => {
+          const el = $(id);
+          el.value = pos >= 0 ? String(headers[pos].c) : (allowNew ? 'new' : '');
+          el.closest('.field').classList.add('ai-picked');
+        };
+        setSel('m-title', pick.title, false);
+        setSel('m-abs', pick.abstract, false);
+        setSel('m-tdec', pick.title_decision, true);
+        setSel('m-adec', pick.abstract_decision, true);
+        preview();
+        const missing = [pick.title < 0 && 'title', pick.abstract < 0 && 'abstract'].filter(Boolean);
+        note.textContent = (missing.length
+          ? `Claude couldn’t find a ${missing.join(' or ')} column. Pick it yourself, then tap Looks right.`
+          : 'Claude picked these columns. Check them, then tap Looks right.') + (pick.note ? ' ' + pick.note : '');
+        note.hidden = false;
+        $('m-go').textContent = 'Looks right';
+        btn.querySelector('span').textContent = 'Identify again';
+      } catch (e) {
+        $('m-err').textContent = e.message || 'The column finder didn’t work. Pick the columns yourself.';
+        $('m-err').hidden = false;
+        btn.querySelector('span').textContent = 'Identify the columns for me';
+      }
+      btn.disabled = false;
+      btn.classList.remove('busy');
+    });
+
     $('m-go').addEventListener('click', async () => {
       const s = read();
       const err = msg => { $('m-err').textContent = msg; $('m-err').hidden = false; };
@@ -469,6 +514,33 @@
       if (s.absDec === 'new') { s.absDec = next++; newHeaders[s.absDec] = DEFAULT_HEADER.a; }
       await finishMapping(draft, s, newHeaders);
     });
+  }
+
+  // Send the headers and a few sample values per column to the column finder.
+  async function identifyColumns(ws, headers) {
+    const rg = rangeOf(ws);
+    const columns = headers.map(h => {
+      const samples = [];
+      for (let r = rg.s.r + 1; r <= rg.e.r && samples.length < 4; r++) {
+        const v = cellText(ws, r, h.c);
+        if (v) samples.push(v.length > 240 ? v.slice(0, 240) + '…' : v);
+      }
+      return { name: h.name, samples };
+    }).slice(0, 80);
+    let res;
+    try {
+      res = await fetch(AI_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + AI_ANON, apikey: AI_ANON },
+        body: JSON.stringify({ columns }),
+      });
+    } catch {
+      throw new Error('Couldn’t reach the column finder. Check your connection, or pick the columns yourself.');
+    }
+    let body = null;
+    try { body = await res.json(); } catch {}
+    if (!res.ok || !body || body.error) throw new Error((body && body.error) || 'The column finder didn’t work. Pick the columns yourself.');
+    return body;
   }
 
   async function finishMapping(draft, cols, newHeaders) {
