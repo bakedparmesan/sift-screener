@@ -32,7 +32,11 @@
    * sources:  { id, projectId, fileName, ext, sheet, cols, newHeaders, fingerprint, decisions:{t,a}, unsaved, stats }
    * files:    { id (= source id), bytes, handle } */
   let idb = null;
-  const mem = { projects: new Map(), sources: new Map(), files: new Map() };
+  const mem = { projects: new Map(), sources: new Map(), files: new Map(), handles: new Map() };
+  // Live-file handles live in their own store so opening a spreadsheet never has to read one, plus a per-visit cache.
+  // (Chrome private windows can end the page when a stored handle is read back; see readHandle.)
+  const handleCache = new Map();
+  let skipStoredHandles = false;
 
   function convertPos(o) {
     const out = { t: null, a: null };
@@ -45,7 +49,7 @@
   function openIDB() {
     return new Promise(resolve => {
       try {
-        const rq = indexedDB.open('sift-screener', 2);
+        const rq = indexedDB.open('sift-screener', 3);
         rq.onupgradeneeded = ev => {
           const d = rq.result;
           const tx = rq.transaction;
@@ -69,6 +73,18 @@
                   ps.put({ id: pid, name: o.name, fileIds: [o.id], pos: convertPos(o), sample: !!o.sample, stats: o.stats,
                     createdAt: o.createdAt || Date.now(), updatedAt: o.updatedAt || Date.now() });
                 }
+              };
+            }
+          }
+          if (ev.oldVersion < 3) {
+            const hs = d.createObjectStore('handles', { keyPath: 'id' });
+            if (ev.oldVersion >= 1) {
+              tx.objectStore('files').openCursor().onsuccess = e => {
+                const cursor = e.target.result;
+                if (!cursor) return;
+                const rec = cursor.value;
+                if (rec.handle) { hs.put({ id: rec.id, handle: rec.handle }); cursor.update({ id: rec.id, bytes: rec.bytes }); }
+                cursor.continue();
               };
             }
           }
@@ -153,8 +169,10 @@
   function cellDecision(ws, r, c) {
     if (c == null || c < 0) return undefined;
     const cell = ws[XL.utils.encode_cell({ r, c })];
-    if (!cell || cell.v == null || cell.v === '') return undefined;
-    const n = Number(String(cell.v).trim());
+    if (!cell || cell.v == null) return undefined;
+    const raw = String(cell.v).trim();
+    if (raw === '') return undefined; // blank or space-only cells are unscreened (Number('') would be 0)
+    const n = Number(raw);
     return n === 0 || n === 1 || n === 2 ? n : undefined;
   }
   function headersOf(ws) {
@@ -201,23 +219,170 @@
     rg.e.c = maxC;
     ws['!ref'] = XL.utils.encode_range(rg);
   }
+  // File types Sift can write back into in place (background saving).
+  const LIVE_TYPES = ['xlsx', 'xlsm', 'csv'];
+
+  /* Write decisions into an .xlsx/.xlsm by editing only the decision cells inside the file's zip.
+   * Every other part (styles, conditional formatting, filters, other sheets, macros) stays byte-for-byte.
+   * Throws if the file has a shape this doesn't handle; the caller then falls back to a full rewrite. */
+  function patchXlsx(bytes, s) {
+    const F = window.fflate;
+    if (!F) throw new Error('zip library missing');
+    const files = F.unzipSync(new Uint8Array(bytes));
+    const text = p => { if (!files[p]) throw new Error('missing ' + p); return F.strFromU8(files[p]); };
+    const parse = str => {
+      const d = new DOMParser().parseFromString(str, 'application/xml');
+      if (d.getElementsByTagName('parsererror').length) throw new Error('xml parse error');
+      return d;
+    };
+    const declOf = str => (str.match(/^\s*<\?xml[^>]*\?>\s*/) || [''])[0].trim();
+    // XMLSerializer may emit its own declaration; keep exactly one (the file's original), or Excel reports damage.
+    const serialize = (d, decl) => (decl ? decl + '\r\n' : '') + new XMLSerializer().serializeToString(d).replace(/^\s*<\?xml[^>]*\?>\s*/, '');
+    const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+
+    // Locate the sheet's XML part.
+    const wbStr = text('xl/workbook.xml');
+    const wbDoc = parse(wbStr);
+    const sheetEl = [...wbDoc.getElementsByTagName('sheet')].find(e => e.getAttribute('name') === s.sheet);
+    if (!sheetEl) throw new Error('sheet not found');
+    const rid = sheetEl.getAttributeNS(R_NS, 'id') || sheetEl.getAttribute('r:id');
+    const relsDoc = parse(text('xl/_rels/workbook.xml.rels'));
+    const rel = [...relsDoc.getElementsByTagName('Relationship')].find(e => e.getAttribute('Id') === rid);
+    if (!rel) throw new Error('sheet relationship not found');
+    const target = rel.getAttribute('Target');
+    const sheetPath = target.startsWith('/') ? target.slice(1) : 'xl/' + target.replace(/^\.\//, '');
+
+    // Collect the edits: header cells for new decision columns, then every decision.
+    const edits = new Map(); // "r,c" -> {r, c, v} (r 0-based)
+    const headerRow = s.headerRow != null ? s.headerRow : 0;
+    for (const [c, name] of Object.entries(s.newHeaders || {})) edits.set(headerRow + ',' + c, { r: headerRow, c: +c, v: String(name), header: true });
+    for (const [key, col] of [['t', s.cols.titleDec], ['a', s.cols.absDec]]) {
+      for (const [r, v] of Object.entries(s.decisions[key])) edits.set(r + ',' + col, { r: +r, c: col, v: Number(v) });
+    }
+
+    const shStr = text(sheetPath);
+    const shDoc = parse(shStr);
+    const NS = shDoc.documentElement.namespaceURI;
+    const sheetData = shDoc.getElementsByTagNameNS(NS, 'sheetData')[0];
+    if (!sheetData) throw new Error('no sheetData');
+    const rowEls = new Map();
+    for (const row of sheetData.getElementsByTagNameNS(NS, 'row')) {
+      const n = +row.getAttribute('r');
+      if (!n) throw new Error('row without number');
+      rowEls.set(n, row);
+    }
+    let removedFormula = false, maxCol = -1, maxRow = -1;
+    const byRow = new Map();
+    for (const e of edits.values()) { if (!byRow.has(e.r)) byRow.set(e.r, []); byRow.get(e.r).push(e); }
+    for (const [r, list] of byRow) {
+      const rowNum = r + 1;
+      let row = rowEls.get(rowNum);
+      if (!row) {
+        row = shDoc.createElementNS(NS, 'row');
+        row.setAttribute('r', String(rowNum));
+        const after = [...rowEls.keys()].filter(n => n > rowNum).sort((a, b) => a - b)[0];
+        sheetData.insertBefore(row, after ? rowEls.get(after) : null);
+        rowEls.set(rowNum, row);
+      }
+      row.removeAttribute('spans'); // only a layout hint; stale once a row gains cells
+      const cells = [...row.getElementsByTagNameNS(NS, 'c')];
+      if (cells.some(c => !c.getAttribute('r'))) throw new Error('cell without reference');
+      for (const e of list) {
+        const ref = XL.utils.encode_cell({ r: e.r, c: e.c });
+        let cell = cells.find(c => c.getAttribute('r') === ref);
+        if (cell) {
+          const f = cell.getElementsByTagNameNS(NS, 'f')[0];
+          if (f) {
+            if (f.getAttribute('t') === 'shared' && f.getAttribute('ref')) throw new Error('shared formula master');
+            removedFormula = true;
+          }
+          for (const a of [...cell.attributes]) if (a.name !== 'r' && a.name !== 's') cell.removeAttribute(a.name); // keep the cell's style
+          while (cell.firstChild) cell.removeChild(cell.firstChild);
+        } else {
+          cell = shDoc.createElementNS(NS, 'c');
+          cell.setAttribute('r', ref);
+          const next = cells.find(c => XL.utils.decode_cell(c.getAttribute('r')).c > e.c);
+          row.insertBefore(cell, next || null);
+          cells.splice(next ? cells.indexOf(next) : cells.length, 0, cell);
+        }
+        if (e.header) {
+          cell.setAttribute('t', 'inlineStr');
+          const is = shDoc.createElementNS(NS, 'is'), t = shDoc.createElementNS(NS, 't');
+          t.textContent = e.v; is.appendChild(t); cell.appendChild(is);
+        } else {
+          const v = shDoc.createElementNS(NS, 'v');
+          v.textContent = String(e.v); cell.appendChild(v);
+        }
+        maxCol = Math.max(maxCol, e.c); maxRow = Math.max(maxRow, e.r);
+      }
+    }
+    // Keep the sheet's declared size covering the cells written.
+    const dim = shDoc.getElementsByTagNameNS(NS, 'dimension')[0];
+    if (dim && dim.getAttribute('ref')) {
+      const d = XL.utils.decode_range(dim.getAttribute('ref'));
+      d.e.c = Math.max(d.e.c, maxCol); d.e.r = Math.max(d.e.r, maxRow);
+      dim.setAttribute('ref', XL.utils.encode_range(d));
+    }
+    files[sheetPath] = F.strToU8(serialize(shDoc, declOf(shStr)));
+
+    // Ask Excel to recalculate formulas on open (e.g. columns that combine two reviewers' decisions).
+    let calc = wbDoc.getElementsByTagNameNS(wbDoc.documentElement.namespaceURI, 'calcPr')[0];
+    if (!calc) {
+      calc = wbDoc.createElementNS(wbDoc.documentElement.namespaceURI, 'calcPr');
+      const later = ['oleSize', 'customWorkbookViews', 'pivotCaches', 'smartTagPr', 'smartTagTypes', 'webPublishing', 'fileRecoveryPr', 'webPublishObjects', 'extLst'];
+      const before = [...wbDoc.documentElement.children].find(el => later.includes(el.localName));
+      wbDoc.documentElement.insertBefore(calc, before || null);
+    }
+    calc.setAttribute('fullCalcOnLoad', '1');
+    files['xl/workbook.xml'] = F.strToU8(serialize(wbDoc, declOf(wbStr)));
+
+    // If a formula cell was overwritten, Excel's calculation chain would point at it; drop the chain (Excel rebuilds it).
+    if (removedFormula && files['xl/calcChain.xml']) {
+      delete files['xl/calcChain.xml'];
+      for (const p of ['xl/_rels/workbook.xml.rels', '[Content_Types].xml']) {
+        const str = text(p), d = parse(str);
+        for (const el of [...d.documentElement.children]) {
+          if ((el.getAttribute('Target') || '').endsWith('calcChain.xml') || (el.getAttribute('PartName') || '').endsWith('calcChain.xml')) el.parentNode.removeChild(el);
+        }
+        files[p] = F.strToU8(serialize(d, declOf(str)));
+      }
+    }
+    return F.zipSync(files, { level: 6 });
+  }
+
   function outputFile(src) {
     const s = src.s;
     const ws = src.wb.Sheets[s.sheet];
-    applyDecisions(ws, s);
+    applyDecisions(ws, s); // keeps the in-memory copy current
     if (s.ext === 'csv') {
       const csv = XL.utils.sheet_to_csv(ws);
       return { name: s.fileName, blob: new Blob(['﻿' + csv], { type: 'text/csv' }) };
     }
+    const type = s.ext === 'xlsm' ? 'application/vnd.ms-excel.sheet.macroEnabled.12' : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    if ((s.ext === 'xlsx' || s.ext === 'xlsm') && src.bytes) {
+      try {
+        return { name: s.fileName, blob: new Blob([patchXlsx(src.bytes, s)], { type }), preserved: true };
+      } catch (e) {
+        console.warn('Sift: in-place save not possible, rewriting the workbook instead.', e);
+      }
+    }
+    // Fallback (and .xls): rebuild the workbook. Cell formatting is not kept on this path.
+    // Old .xls column outlines arrive as "level", which is not a valid .xlsx attribute (outlineLevel is kept).
+    for (const name of src.wb.SheetNames) for (const col of src.wb.Sheets[name]['!cols'] || []) if (col) delete col.level;
     const out = XL.write(src.wb, { bookType: 'xlsx', type: 'array', cellStyles: true, compression: true });
     const name = s.ext === 'xlsx' ? s.fileName : baseName(s.fileName) + '.xlsx';
-    return { name, blob: new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }) };
+    return { name, blob: new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), preserved: false };
   }
+  // Fold decisions already in the file into Sift's record. Returns true if Sift holds decisions the file lacks.
   function mergeFileDecisions(s, rows) {
+    let fileBehind = false;
     for (const x of rows) {
       if (x.ft !== undefined && s.decisions.t[x.r] === undefined) s.decisions.t[x.r] = x.ft;
       if (x.fa !== undefined && s.decisions.a[x.r] === undefined) s.decisions.a[x.r] = x.fa;
+      if (s.decisions.t[x.r] !== undefined && s.decisions.t[x.r] !== x.ft) fileBehind = true;
+      if (s.decisions.a[x.r] !== undefined && s.decisions.a[x.r] !== x.fa) fileBehind = true;
     }
+    return fileBehind;
   }
 
   /* ------------------------------------------------------------------ state */
@@ -457,6 +622,7 @@
           multiple: false,
           types: [{ description: 'Spreadsheet', accept: {
             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
+            'application/vnd.ms-excel.sheet.macroEnabled.12': ['.xlsm'],
             'application/vnd.ms-excel': ['.xls'],
             'text/csv': ['.csv'],
           } }],
@@ -478,7 +644,7 @@
   async function startImport(file, handle) {
     if (!cur) return;
     const ext = extOf(file.name);
-    if (!['xlsx', 'xls', 'csv', 'xlsm'].includes(ext)) { toast('Choose an .xlsx, .xls or .csv file.'); return; }
+    if (!['xlsx', 'xls', 'csv', 'xlsm'].includes(ext)) { toast('Choose an .xlsx, .xlsm, .xls or .csv file.'); return; }
     let bytes, wb;
     try {
       bytes = await file.arrayBuffer();
@@ -673,6 +839,7 @@
       for (const k of ['t', 'a']) if (cur.p.pos[k] && cur.p.pos[k].sid === s.id) cur.p.pos[k] = null;
     }
     s.sheet = draft.sheet;
+    s.headerRow = rangeOf(ws).s.r;
     s.cols = cols;
     s.newHeaders = newHeaders;
     s.fingerprint = fingerprint(draft.sheet, rows);
@@ -683,9 +850,11 @@
     await saveSource(s);
     if (!ex) {
       const bytes = draft.bytes || XL.write(draft.wb, { bookType: 'xlsx', type: 'array' });
-      await db.put('files', { id: s.id, bytes, handle: draft.handle || null }).catch(() => {});
+      await db.put('files', { id: s.id, bytes }).catch(() => {});
       cur.p.fileIds.push(s.id);
-      cur.srcs.push({ s, wb: draft.wb, rows, handle: draft.handle || null, live: !!draft.handle, reconnect: false });
+      const live = !!draft.handle && LIVE_TYPES.includes(s.ext);
+      if (live) rememberHandle(s.id, draft.handle);
+      cur.srcs.push({ s, wb: draft.wb, rows, bytes, handle: live ? draft.handle : null, live, reconnect: false });
     } else {
       const src = cur.srcs.find(x => x.s.id === s.id);
       Object.assign(src, { s, wb: draft.wb, rows });
@@ -699,12 +868,30 @@
     if (!ex) toast(`Added ${s.fileName}`);
   }
 
+  /* ------------------------------------------------------------------ live-file handles */
+  function rememberHandle(id, handle) {
+    if (!handle) return;
+    handleCache.set(id, handle);
+    db.put('handles', { id, handle }).catch(() => {});
+  }
+  async function readHandle(id) {
+    if (handleCache.has(id)) return handleCache.get(id);
+    if (skipStoredHandles) return null;
+    // If reading the handle ends the page, this marker is still here on the next load and we skip stored handles.
+    try { sessionStorage.setItem('sift-reading-handle', id); } catch {}
+    const rec = await db.get('handles', id).catch(() => null);
+    try { sessionStorage.removeItem('sift-reading-handle'); } catch {}
+    if (rec && rec.handle) handleCache.set(id, rec.handle);
+    return rec ? rec.handle : null;
+  }
+
   /* ------------------------------------------------------------------ open project */
   async function loadSource(id, askPermission) {
     const s = await db.get('sources', id).catch(() => null);
     const rec = await db.get('files', id).catch(() => null);
     if (!s || !rec) return null;
-    let bytes = rec.bytes, handle = rec.handle || null, live = false, reconnect = false;
+    let bytes = rec.bytes, handle = null, live = false, reconnect = false;
+    if (canLiveSave && LIVE_TYPES.includes(s.ext)) handle = await readHandle(id); // old .xls files: Save Excel file instead
     if (handle && canLiveSave) {
       try {
         let perm = await handle.queryPermission({ mode: 'readwrite' });
@@ -713,16 +900,17 @@
           const file = await handle.getFile();
           bytes = await file.arrayBuffer();
           live = true;
-          db.put('files', { id, bytes, handle }).catch(() => {});
+          db.put('files', { id, bytes }).catch(() => {});
         } else reconnect = true;
       } catch { reconnect = true; }
     }
     let wb;
     try { wb = readWorkbook(bytes); } catch { return null; }
-    if (!wb.Sheets[s.sheet]) return { s, wb, rows: [], handle, live, reconnect, broken: true };
+    if (!wb.Sheets[s.sheet]) return { s, wb, bytes, rows: [], handle, live, reconnect, broken: true };
+    if (s.headerRow == null) s.headerRow = rangeOf(wb.Sheets[s.sheet]).s.r;
     const rows = readRows(wb.Sheets[s.sheet], s.cols);
-    mergeFileDecisions(s, rows);
-    return { s, wb, rows, handle, live, reconnect };
+    const fileBehind = mergeFileDecisions(s, rows);
+    return { s, wb, bytes, rows, handle, live, reconnect, fileBehind };
   }
 
   async function openProject(id) {
@@ -739,6 +927,8 @@
     }
     p.fileIds = srcs.map(x => x.s.id);
     cur = { p, srcs };
+    // e.g. the page closed moments after a swipe: bring the Excel file up to date now
+    for (const src of srcs) if (src.live && src.fileBehind) queueLiveSave(src);
     refreshStats();
     saveProject(p);
     renderProject();
@@ -871,8 +1061,9 @@
   function queueLiveSave(src) {
     if (!src || !src.live) return;
     liveDirty.add(src);
+    if (liveState !== 'error') { liveState = 'saving'; refreshSaveButton(); } // don't claim "saved" while a write is pending
     clearTimeout(liveTimer);
-    liveTimer = setTimeout(liveSave, 700);
+    liveTimer = setTimeout(liveSave, 400);
   }
   async function liveSave() {
     if (liveBusy) { clearTimeout(liveTimer); liveTimer = setTimeout(liveSave, 400); return; }
@@ -888,7 +1079,7 @@
         await w.close();
         src.s.unsaved = 0;
         saveSource(src.s);
-        blob.arrayBuffer().then(bytes => db.put('files', { id: src.s.id, bytes, handle: src.handle })).catch(() => {});
+        blob.arrayBuffer().then(bytes => db.put('files', { id: src.s.id, bytes })).catch(() => {});
       } catch (e) {
         failed = true;
         liveDirty.add(src);
@@ -897,8 +1088,8 @@
           : `Couldn’t write to ${src.s.fileName}. Your progress is still saved here.`, 5000);
       }
     }
-    liveState = failed ? 'error' : 'ok';
     liveBusy = false;
+    liveState = failed ? 'error' : liveDirty.size ? 'saving' : 'ok'; // more swipes may have arrived during the write
     refreshSaveButton();
   }
   function retryLive() {
@@ -1266,6 +1457,7 @@
       const id = d.removeYes;
       await db.del('sources', id).catch(() => {});
       await db.del('files', id).catch(() => {});
+      await db.del('handles', id).catch(() => {}); handleCache.delete(id);
       cur.srcs = cur.srcs.filter(x => x.s.id !== id);
       cur.p.fileIds = cur.p.fileIds.filter(x => x !== id);
       for (const k of ['t', 'a']) if (cur.p.pos[k] && cur.p.pos[k].sid === id) cur.p.pos[k] = null;
@@ -1296,7 +1488,7 @@
           <button class="btn danger" data-act="delete-yes">Delete</button><button class="btn" data-act="project">Cancel</button></span>`;
         return;
       case 'delete-yes':
-        for (const id of cur.p.fileIds) { await db.del('sources', id).catch(() => {}); await db.del('files', id).catch(() => {}); }
+        for (const id of cur.p.fileIds) { await db.del('sources', id).catch(() => {}); await db.del('files', id).catch(() => {}); await db.del('handles', id).catch(() => {}); handleCache.delete(id); }
         await db.del('projects', cur.p.id).catch(() => {});
         await loadProjects();
         toast('Project deleted');
@@ -1352,6 +1544,13 @@
 
   async function boot() {
     if (!XL) { app.innerHTML = '<section class="view"><div class="wrap"><h1>Sift couldn’t start</h1><p class="note">The spreadsheet library didn’t load. Reload the page.</p></div></section>'; return; }
+    try {
+      if (sessionStorage.getItem('sift-reading-handle')) {
+        sessionStorage.removeItem('sift-reading-handle');
+        skipStoredHandles = true;
+        setTimeout(() => toast('Sift couldn’t reconnect to your Excel file in this window, so automatic saving is off here. Use Save Excel file, or open Sift in a normal (not private) window.', 8000), 300);
+      }
+    } catch {}
     idb = await openIDB();
     if (!idb) toast('This browser is blocking storage, so progress will only last until you close the page.', 6000);
     try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch {}
