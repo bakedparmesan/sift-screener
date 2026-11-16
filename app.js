@@ -2,7 +2,7 @@
  * A project is a named review holding one or more spreadsheet files (e.g. one export per database).
  * Everything runs in the browser; projects live in IndexedDB on this device.
  * On desktop Chrome/Edge each Excel file is updated in the background (File System Access API).
- * Elsewhere (iPhone, Android, Safari, Firefox) "Save Excel" hands you the updated files. */
+ * Elsewhere (iPhone, Android, Safari, Firefox) "Save Excel file" hands you the updated files. */
 (() => {
   'use strict';
 
@@ -264,6 +264,54 @@
     const w = k => (100 * s[k] / s.total).toFixed(2) + '%';
     return `<span class="bar"><i class="i" style="width:${w(1)}"></i><i class="m" style="width:${w(2)}"></i><i class="e" style="width:${w(0)}"></i></span>`;
   }
+  // A real progress bar: share of records screened.
+  function meterHTML(done, total) {
+    const pct = total ? Math.round(100 * done / total) : 0;
+    return `<div class="meter" role="progressbar" aria-valuemin="0" aria-valuemax="${total}" aria-valuenow="${done}" aria-label="${fmt(done)} of ${fmt(total)} screened"><i style="width:${total ? (100 * done / total).toFixed(2) : 0}%"></i></div>`;
+  }
+  // Donut chart of include / maybe / exclude, with a legend that carries the figures.
+  const SPLIT = [[1, 'Include', 'inc'], [2, 'Maybe', 'may'], [0, 'Exclude', 'exc']];
+  function splitHTML(st) {
+    const decided = st[1] + st[2] + st[0];
+    const R = 42, SW = 14, C = 2 * Math.PI * R, GAP = 2;
+    const parts = SPLIT.filter(([k]) => st[k] > 0);
+    let offset = 0, arcs = '';
+    for (const [k, name, cls] of parts) {
+      const frac = st[k] / decided;
+      const len = Math.max(0.5, frac * C - (parts.length > 1 ? GAP : 0));
+      const tip = `${name}: ${fmt(st[k])} (${Math.round(frac * 100)}%)`;
+      arcs += `<circle class="arc ${cls}" cx="50" cy="50" r="${R}" stroke-width="${SW}" stroke-dasharray="${len.toFixed(2)} ${(C - len).toFixed(2)}" stroke-dashoffset="${(-offset).toFixed(2)}" data-tip="${esc(tip)}"><title>${esc(tip)}</title></circle>`;
+      offset += frac * C;
+    }
+    const legend = SPLIT.map(([k, name, cls]) => `<li><span class="sw ${cls}" aria-hidden="true"></span><span class="lg-name">${name}</span><b class="num">${fmt(st[k])}</b><span class="lg-pct num">${decided ? Math.round(100 * st[k] / decided) + '%' : '–'}</span></li>`).join('');
+    return `<div class="split">
+      <div class="donut-wrap">
+        <svg class="donut" viewBox="0 0 100 100" role="img" aria-label="${SPLIT.map(([k, n]) => `${n} ${st[k]}`).join(', ')}">
+          <circle class="track" cx="50" cy="50" r="${R}" stroke-width="${SW}"/>
+          <g transform="rotate(-90 50 50)">${arcs}</g>
+        </svg>
+        <div class="donut-label"><b class="num">${fmt(decided)}</b><span>${decided ? 'decided' : 'none yet'}</span></div>
+        <div class="donut-tip" hidden></div>
+      </div>
+      <ul class="legend">${legend}</ul>
+    </div>`;
+  }
+  // Hover / tap a slice to see its figures.
+  app.addEventListener('pointerover', e => {
+    const arc = e.target.closest && e.target.closest('.arc');
+    if (!arc) return;
+    const wrap = arc.closest('.donut-wrap'), tip = wrap.querySelector('.donut-tip');
+    tip.textContent = arc.dataset.tip; tip.hidden = false;
+    wrap.querySelectorAll('.arc').forEach(a => a.classList.toggle('dim', a !== arc));
+  });
+  app.addEventListener('pointerout', e => {
+    const arc = e.target.closest && e.target.closest('.arc');
+    if (!arc) return;
+    const wrap = arc.closest('.donut-wrap');
+    wrap.querySelector('.donut-tip').hidden = true;
+    wrap.querySelectorAll('.arc').forEach(a => a.classList.remove('dim'));
+  });
+
   function renderHome() {
     view = 'home'; cur = null; screen = null;
     const list = projects.map(p => {
@@ -300,7 +348,7 @@
       `}
       <p class="note">${canLiveSave
         ? 'On this browser, decisions are written straight into your Excel files as you swipe.'
-        : 'Progress is saved on this device after every swipe. Use <b>Save Excel</b> to get the updated spreadsheets. For automatic saving into the files themselves, open Sift in Chrome or Edge on a computer.'}</p>
+        : 'Progress is saved on this device after every swipe. Use <b>Save Excel file</b> to get the updated spreadsheets. For automatic saving into the files themselves, open Sift in Chrome or Edge on a computer.'}</p>
       ${projects.length ? '<div><button class="link" data-act="sample">Add an example project</button></div>' : ''}
     </div></section>`;
   }
@@ -730,14 +778,12 @@
       const label = left > 0 ? `Screen ${fmt(left)} remaining ${noun}${left === 1 ? '' : 's'}` : `All ${noun}s screened · review`;
       return `<div class="stage">
         <h3 class="stage-title">${STAGE_NAME[k]}</h3>
-        <div class="big num">${fmt(st.done)}<small> / ${fmt(st.total)} screened</small></div>
-        ${barHTML(st)}
-        <div class="tally num">
-          <span class="ci"><b>${fmt(st[1])}</b>Include</span>
-          <span class="ce"><b>${fmt(st[0])}</b>Exclude</span>
-          <span class="cm"><b>${fmt(st[2])}</b>Maybe</span>
-          <span><b>${fmt(left)}</b>Left</span>
+        <div class="progress-block">
+          <div class="prog-head num"><span class="big">${st.total ? Math.round(100 * st.done / st.total) : 0}%<small> screened</small></span>
+            <span class="muted small">${fmt(st.done)} of ${fmt(st.total)} · ${fmt(left)} left</span></div>
+          ${meterHTML(st.done, st.total)}
         </div>
+        ${splitHTML(st)}
         <p class="small muted">${k === 'a' ? 'Records included or marked maybe at title stage.' : multi ? `Every record across ${srcs.length} files.` : 'Every record in the file.'}</p>
         <button class="btn ${locked ? '' : 'primary'}" data-stage="${k}" ${locked ? 'disabled' : ''}>${locked ? 'Include some titles first' : label}</button>
       </div>`;
@@ -759,7 +805,7 @@
           <span>${barHTML(st.a)}Abstracts ${fmt(st.a.done)} / ${fmt(st.a.total)}</span>
         </div>
         <div class="f-actions" data-slot="${esc(f.id)}">
-          ${src.live ? '' : `<button class="link small" data-save-one="${esc(f.id)}">Save Excel</button>`}
+          ${src.live ? '' : `<button class="link small" data-save-one="${esc(f.id)}">Save Excel file</button>`}
           <button class="link small" data-columns="${esc(f.id)}">Change columns</button>
           <button class="link small danger-link" data-remove="${esc(f.id)}">Remove</button>
         </div>
@@ -791,7 +837,7 @@
       </div>
       ${srcs.length ? `<p class="note">${srcs.every(x => x.live)
         ? 'Live files: every decision is written into the Excel files on this computer a moment after you swipe.'
-        : 'Progress is saved on this device after every swipe. <b>Save Excel</b> gives you the spreadsheets with all decisions filled in.'}</p>` : ''}
+        : 'Progress is saved on this device after every swipe. <b>Save Excel file</b> gives you the spreadsheets with all decisions filled in.'}</p>` : ''}
     </div></section>`;
   }
 
@@ -823,13 +869,13 @@
     const pending = nonLive();
     if (!pending.length) {
       const st = liveState;
-      const text = st === 'saving' ? 'Saving…' : st === 'error' ? 'Not saved · retry' : 'Saved to file';
+      const text = st === 'saving' ? 'Saving to Excel file…' : st === 'error' ? 'Not saved · retry' : 'Changes saved to Excel file';
       return `<button class="${isBtn ? 'btn' : 'save'} ${st === 'error' ? 'err' : st === 'saving' ? 'pending' : 'ok'}" data-act="live-retry" id="save-btn">${text}</button>`;
     }
     const n = pending.reduce((a, x) => a + (x.s.unsaved || 0), 0);
-    const files = pending.length > 1 ? ' files' : '';
-    if (isBtn) return `<button class="btn" data-act="export" id="save-btn">Save Excel${files}${n ? ` · ${fmt(n)} new` : ''}</button>`;
-    return `<button class="save ${n ? 'pending' : 'ok'}" data-act="export" id="save-btn">${n ? `Save Excel · ${fmt(n)}` : 'Save Excel'}</button>`;
+    const label = pending.length > 1 ? 'Save Excel files' : 'Save Excel file';
+    if (isBtn) return `<button class="btn" data-act="export" id="save-btn">${label}${n ? ` · ${fmt(n)} new` : ''}</button>`;
+    return `<button class="save ${n ? 'pending' : 'ok'}" data-act="export" id="save-btn">${label}${n ? ` · ${fmt(n)}` : ''}</button>`;
   }
   function refreshSaveButton() {
     const b = document.getElementById('save-btn');
@@ -937,7 +983,7 @@
   }
   function startStage(stage) {
     const queue = buildQueue(stage);
-    screen = { stage, queue, qi: 0, busy: false };
+    screen = { stage, queue, qi: 0, busy: false, review: false };
     const pos = cur.p.pos[stage];
     let qi = !pos || pos === -1 ? -1 : queue.findIndex(it => cur.srcs[it.k].s.id === pos.sid && it.x.r === pos.r);
     if (qi < 0) qi = nextUndecided(0);
@@ -988,9 +1034,9 @@
     const { stage, queue, qi } = screen;
     const st = refreshStats()[stage];
     document.getElementById('s-count').textContent = qi < queue.length
-      ? `Record ${fmt(qi + 1)} of ${fmt(queue.length)} · ${fmt(st.done)} screened`
+      ? `${screen.review ? 'Reviewing' : 'Record'} ${fmt(qi + 1)} of ${fmt(queue.length)} · ${fmt(st.done)} screened`
       : `${fmt(st.done)} of ${fmt(queue.length)} screened`;
-    document.getElementById('s-bar').innerHTML = barHTML(st);
+    document.getElementById('s-bar').innerHTML = meterHTML(st.done, st.total);
   }
 
   function cardHTML(item, idx, under) {
@@ -1009,7 +1055,7 @@
         </div>
       </div>
       ${under ? '' : `<span class="stamp s-in">INCLUDE</span><span class="stamp s-out">EXCLUDE</span><span class="stamp s-may">MAYBE</span>`}
-      ${under || v === undefined ? '' : `<div class="row" style="justify-content:center"><button class="link small" data-act="resume">Skip to next unscreened record</button></div>`}
+      ${under || (v === undefined && !screen.review) ? '' : `<div class="row" style="justify-content:center"><button class="link small" data-act="resume">${screen.review ? 'Skip to next record' : 'Skip to next unscreened record'}</button></div>`}
     </article>`;
   }
 
@@ -1023,11 +1069,12 @@
       const st = cur.p.stats[stage];
       const left = queue.length - st.done;
       const allLive = !nonLive().length;
+      screen.review = false;
       deck.innerHTML = `<div class="done"><div>
         <h1>${left ? `${fmt(left)} records still unscreened` : `All ${fmt(queue.length)} records screened`}</h1>
-        <p class="muted num">${fmt(st[1])} included · ${fmt(st[0])} excluded · ${fmt(st[2])} maybe</p>
+        ${splitHTML(st)}
         <div class="row" style="justify-content:center">
-          ${allLive ? '' : `<button class="btn primary" data-act="export">Save Excel</button>`}
+          ${allLive ? '' : `<button class="btn primary" data-act="export">${nonLive().length > 1 ? 'Save Excel files' : 'Save Excel file'}</button>`}
           ${stage === 't' && st[1] + st[2] > 0 ? `<button class="btn${allLive ? ' primary' : ''}" data-stage="a">Start abstract screening</button>` : ''}
           <button class="btn" data-act="review">Review from the start</button>
         </div>
@@ -1041,7 +1088,8 @@
     controls.querySelectorAll('[data-dec]').forEach(b => { b.disabled = false; });
     hints.hidden = false;
     let nextIdx = -1;
-    for (let i = qi + 1; i < queue.length; i++) if (decOf(stage, queue[i]) === undefined) { nextIdx = i; break; }
+    if (screen.review) nextIdx = qi + 1 < queue.length ? qi + 1 : -1;
+    else for (let i = qi + 1; i < queue.length; i++) if (decOf(stage, queue[i]) === undefined) { nextIdx = i; break; }
     deck.innerHTML = (nextIdx >= 0 ? cardHTML(queue[nextIdx], nextIdx, true) : '') + cardHTML(queue[qi], qi, false);
     const card = deck.querySelector('.card:not(.under)');
     if (animateIn) {
@@ -1060,7 +1108,8 @@
     src.s.decisions[stage][item.x.r] = v;
     if (prev !== v) src.s.unsaved = (src.s.unsaved || 0) + 1;
     src.s.updatedAt = Date.now();
-    screen.qi = nextUndecided(qi + 1);
+    // Reviewing walks through every record in order; normal screening jumps to the next unscreened one.
+    screen.qi = screen.review ? qi + 1 : nextUndecided(qi + 1);
     cur.p.pos[stage] = posOf(screen.qi);
     refreshStats();
     saveSource(src.s);
@@ -1259,8 +1308,8 @@
       case 'criteria': return toggleCriteria();
       case 'criteria-close': return toggleCriteria(false);
       case 'criteria-add': renderProject(); return renderEditCriteria();
-      case 'resume': screen.qi = nextUndecided(screen.qi); return renderDeck(false);
-      case 'review': screen.qi = 0; return renderDeck(false);
+      case 'resume': screen.qi = screen.review ? screen.qi + 1 : nextUndecided(screen.qi); return renderDeck(false);
+      case 'review': screen.review = true; screen.qi = 0; return renderDeck(false);
       case 'delete':
         document.getElementById('del-slot').innerHTML = `<span class="confirm"><span class="small muted">Delete this project from this device? Your Excel files aren’t touched.</span>
           <button class="btn danger" data-act="delete-yes">Delete</button><button class="btn" data-act="project">Cancel</button></span>`;
