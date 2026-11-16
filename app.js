@@ -513,7 +513,7 @@
       `}
       <p class="note">${canLiveSave
         ? 'On this browser, decisions are written straight into your Excel files as you swipe.'
-        : 'Progress is saved on this device after every swipe. Use <b>Download updated Excel file</b> when you finish, or <b>Download Excel file</b> in a project, to get the updated spreadsheets. For automatic saving into the files themselves, open Sift in Chrome or Edge on a computer.'}</p>
+        : 'Progress is saved on this device after every decision. Click <b>Download Excel file</b> to save the updated spreadsheets to your device. To avoid needing to download the updated file and have it edited directly on your device, open Sift in Chrome or Edge on a computer.'}</p>
       ${projects.length ? '<div><button class="link" data-act="sample">Add an example project</button></div>' : ''}
     </div></section>`;
   }
@@ -1008,7 +1008,7 @@
       </div>
       ${srcs.length ? `<p class="note">${srcs.every(x => x.live)
         ? 'Live files: every decision is written into the Excel files on this computer a moment after you swipe.'
-        : 'Progress is saved on this device after every swipe. <b>Download Excel file</b> gives you copies of the spreadsheets with all decisions filled in.'}</p>` : ''}
+        : 'Progress is saved on this device after every decision. Click <b>Download Excel file</b> to save the updated spreadsheets to your device. To avoid needing to download the updated file and have it edited directly on your device, open Sift in Chrome or Edge on a computer.'}</p>` : ''}
     </div></section>`;
   }
 
