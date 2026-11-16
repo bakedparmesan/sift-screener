@@ -450,7 +450,7 @@
   }
   const isDecisionName = n => /screen|decision|include|exclu|incl|verdict/i.test(n);
 
-  function renderMap(draft) {
+  function renderMap(draft, aiPick) {
     view = 'map';
     const ws = draft.wb.Sheets[draft.sheet];
     const headers = headersOf(ws);
@@ -528,32 +528,42 @@
     ['m-title', 'm-abs', 'm-tdec', 'm-adec'].forEach(id => $(id).addEventListener('change', preview));
     if ($('m-sheet')) $('m-sheet').addEventListener('change', e => renderMap({ ...draft, sheet: e.target.value }));
 
+    // Fill the form from the column finder's answer (positions are within the chosen sheet).
+    const applyPick = pick => {
+      const note = $('m-ai-note');
+      const setSel = (id, pos, allowNew) => {
+        const el = $(id);
+        el.value = pos >= 0 && headers[pos] ? String(headers[pos].c) : (allowNew ? 'new' : '');
+        el.closest('.field').classList.add('ai-picked');
+      };
+      if ($('m-sheet')) $('m-sheet').closest('.field').classList.add('ai-picked');
+      setSel('m-title', pick.title, false);
+      setSel('m-abs', pick.abstract, false);
+      setSel('m-tdec', pick.title_decision, true);
+      setSel('m-adec', pick.abstract_decision, true);
+      preview();
+      const multi = draft.wb.SheetNames.length > 1;
+      const missing = [pick.title < 0 && 'title', pick.abstract < 0 && 'abstract'].filter(Boolean);
+      const what = multi ? `the “${draft.sheet}” sheet and these columns` : 'these columns';
+      note.textContent = (missing.length
+        ? `Claude picked ${multi ? `the “${draft.sheet}” sheet` : 'some columns'} but couldn’t find a ${missing.join(' or ')} column. Pick it yourself, then tap Looks right.`
+        : `Claude picked ${what}. Check them, then tap Looks right.`) + (pick.note ? ' ' + pick.note : '');
+      note.hidden = false;
+      $('m-go').textContent = 'Looks right';
+      $('m-ai').querySelector('span').textContent = 'Identify again';
+    };
+
     $('m-ai').addEventListener('click', async () => {
-      const btn = $('m-ai'), note = $('m-ai-note');
+      const btn = $('m-ai');
       btn.disabled = true;
       btn.classList.add('busy');
       btn.querySelector('span').textContent = 'Reading your file…';
-      note.hidden = true;
+      $('m-ai-note').hidden = true;
       $('m-err').hidden = true;
       try {
-        const pick = await identifyColumns(ws, headers);
-        const setSel = (id, pos, allowNew) => {
-          const el = $(id);
-          el.value = pos >= 0 ? String(headers[pos].c) : (allowNew ? 'new' : '');
-          el.closest('.field').classList.add('ai-picked');
-        };
-        setSel('m-title', pick.title, false);
-        setSel('m-abs', pick.abstract, false);
-        setSel('m-tdec', pick.title_decision, true);
-        setSel('m-adec', pick.abstract_decision, true);
-        preview();
-        const missing = [pick.title < 0 && 'title', pick.abstract < 0 && 'abstract'].filter(Boolean);
-        note.textContent = (missing.length
-          ? `Claude couldn’t find a ${missing.join(' or ')} column. Pick it yourself, then tap Looks right.`
-          : 'Claude picked these columns. Check them, then tap Looks right.') + (pick.note ? ' ' + pick.note : '');
-        note.hidden = false;
-        $('m-go').textContent = 'Looks right';
-        btn.querySelector('span').textContent = 'Identify again';
+        const pick = await identifyColumns(draft.wb);
+        if (pick.sheetName !== draft.sheet) return renderMap({ ...draft, sheet: pick.sheetName }, pick); // re-render on the chosen sheet
+        applyPick(pick);
       } catch (e) {
         $('m-err').textContent = e.message || 'The column finder didn’t work. Pick the columns yourself.';
         $('m-err').hidden = false;
@@ -562,6 +572,7 @@
       btn.disabled = false;
       btn.classList.remove('busy');
     });
+    if (aiPick) applyPick(aiPick);
 
     $('m-go').addEventListener('click', async () => {
       const s = read();
@@ -579,23 +590,34 @@
     });
   }
 
-  // Send the headers and a few sample values per column to the column finder.
-  async function identifyColumns(ws, headers) {
-    const rg = rangeOf(ws);
-    const columns = headers.map(h => {
-      const samples = [];
-      for (let r = rg.s.r + 1; r <= rg.e.r && samples.length < 4; r++) {
-        const v = cellText(ws, r, h.c);
-        if (v) samples.push(v.length > 240 ? v.slice(0, 240) + '…' : v);
-      }
-      return { name: h.name, samples };
-    }).slice(0, 80);
+  // Send every sheet's name, size, headers and a few sample values per column to the column finder.
+  async function identifyColumns(wb) {
+    const names = wb.SheetNames.slice(0, 15);
+    const multi = names.length > 1;
+    const perSample = multi ? 3 : 4, cut = multi ? 200 : 240;
+    let budget = 300; // columns across all sheets
+    const sheets = names.map(name => {
+      const ws = wb.Sheets[name];
+      if (!ws || !ws['!ref']) return { name, rows: 0, columns: [] };
+      const rg = rangeOf(ws);
+      const headers = headersOf(ws).slice(0, Math.min(80, Math.max(0, budget)));
+      budget -= headers.length;
+      const columns = headers.map(h => {
+        const samples = [];
+        for (let r = rg.s.r + 1; r <= rg.e.r && samples.length < perSample; r++) {
+          const v = cellText(ws, r, h.c);
+          if (v) samples.push(v.length > cut ? v.slice(0, cut) + '…' : v);
+        }
+        return { name: h.name, samples };
+      });
+      return { name, rows: Math.max(0, rg.e.r - rg.s.r), columns };
+    });
     let res;
     try {
       res = await fetch(AI_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + AI_ANON, apikey: AI_ANON },
-        body: JSON.stringify({ columns }),
+        body: JSON.stringify({ sheets }),
       });
     } catch {
       throw new Error('Couldn’t reach the column finder. Check your connection, or pick the columns yourself.');
@@ -603,7 +625,9 @@
     let body = null;
     try { body = await res.json(); } catch {}
     if (!res.ok || !body || body.error) throw new Error((body && body.error) || 'The column finder didn’t work. Pick the columns yourself.');
-    return body;
+    const sheetName = names[body.sheet ?? 0];
+    if (!sheetName || !sheets[names.indexOf(sheetName)].columns.length) throw new Error('Claude picked an empty sheet. Choose the sheet and columns yourself.');
+    return { ...body, sheetName };
   }
 
   async function finishMapping(draft, cols, newHeaders) {
