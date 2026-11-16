@@ -513,7 +513,7 @@
       `}
       <p class="note">${canLiveSave
         ? 'On this browser, decisions are written straight into your Excel files as you swipe.'
-        : 'Progress is saved on this device after every swipe. Use <b>Save Excel file</b> to get the updated spreadsheets. For automatic saving into the files themselves, open Sift in Chrome or Edge on a computer.'}</p>
+        : 'Progress is saved on this device after every swipe. Use <b>Download updated Excel file</b> when you finish, or <b>Download Excel file</b> in a project, to get the updated spreadsheets. For automatic saving into the files themselves, open Sift in Chrome or Edge on a computer.'}</p>
       ${projects.length ? '<div><button class="link" data-act="sample">Add an example project</button></div>' : ''}
     </div></section>`;
   }
@@ -1008,7 +1008,7 @@
       </div>
       ${srcs.length ? `<p class="note">${srcs.every(x => x.live)
         ? 'Live files: every decision is written into the Excel files on this computer a moment after you swipe.'
-        : 'Progress is saved on this device after every swipe. <b>Save Excel file</b> gives you the spreadsheets with all decisions filled in.'}</p>` : ''}
+        : 'Progress is saved on this device after every swipe. <b>Download Excel file</b> gives you copies of the spreadsheets with all decisions filled in.'}</p>` : ''}
     </div></section>`;
   }
 
@@ -1045,7 +1045,10 @@
     }
     const n = pending.reduce((a, x) => a + (x.s.unsaved || 0), 0);
     const label = pending.length > 1 ? 'Save Excel files' : 'Save Excel file';
-    if (isBtn) return `<button class="btn" data-act="export" id="save-btn">${label}${n ? ` · ${fmt(n)} new` : ''}</button>`;
+    if (isBtn) {
+      const dl = pending.length > 1 ? 'Download Excel files' : 'Download Excel file';
+      return `<button class="btn" data-act="export" id="save-btn">${dl}${n ? ` · ${fmt(n)} new decision${n === 1 ? '' : 's'}` : ''}</button>`;
+    }
     return `<button class="save ${n ? 'pending' : 'ok'}" data-act="export" id="save-btn">${label}${n ? ` · ${fmt(n)}` : ''}</button>`;
   }
   function refreshSaveButton() {
@@ -1246,7 +1249,7 @@
         <h1>${left ? `${fmt(left)} records still unscreened` : `All ${fmt(queue.length)} records screened`}</h1>
         ${splitHTML(st)}
         <div class="row" style="justify-content:center">
-          ${allLive ? '' : `<button class="btn primary" data-act="export">${nonLive().length > 1 ? 'Save Excel files' : 'Save Excel file'}</button>`}
+          ${allLive ? '' : `<button class="btn primary" data-act="export">${nonLive().length > 1 ? 'Download updated Excel files' : 'Download updated Excel file'}</button>`}
           ${stage === 't' && st[1] + st[2] > 0 ? `<button class="btn${allLive ? ' primary' : ''}" data-stage="a">Start abstract screening</button>` : ''}
           <button class="btn" data-act="review">Review from the start</button>
         </div>
