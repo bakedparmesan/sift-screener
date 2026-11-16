@@ -299,8 +299,7 @@ p { margin: 0; }
 .btn.magic.busy svg { animation: wiggle 0.9s ease-in-out infinite; }
 @keyframes wiggle { 0%, 100% { transform: rotate(0); } 50% { transform: rotate(-14deg); } }
 .ai-note { font-size: 14px; color: var(--ai); max-width: 60ch; }
-.field.ai-picked select { border-color: color-mix(in srgb, var(--ai) 60%, transparent); }
-.field.ai-picked label::after { content: " · suggested"; color: var(--ai); }
+.field.ai-picked select { border-color: var(--ai); box-shadow: 0 0 0 1px color-mix(in srgb, var(--ai) 35%, transparent); }
 @media (prefers-reduced-motion: reduce) { .btn.magic.busy svg { animation: none; } }
 
 /* ---------- eligibility criteria ---------- */
@@ -373,3 +372,6 @@ p { margin: 0; }
 .legend b { font-weight: 500; color: var(--fg); }
 .legend .lg-pct { color: var(--faint); text-align: right; }
 .done .split { width: 100%; max-width: 320px; text-align: left; }
+
+.btn.magic:disabled { opacity: .4; cursor: not-allowed; }
+.btn.magic:disabled svg { color: var(--muted); }

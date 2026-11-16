@@ -488,7 +488,7 @@
       return;
     }
     if (!wb.SheetNames.length) { toast('That file has no sheets.'); return; }
-    renderMap({ fileName: file.name, ext, bytes, handle, wb, sheet: wb.SheetNames[0], existing: null });
+    renderMap({ fileName: file.name, ext, bytes, handle, wb, sheet: wb.SheetNames.length > 1 ? null : wb.SheetNames[0], existing: null });
   }
 
   /* ------------------------------------------------------------------ column mapping */
@@ -498,14 +498,15 @@
   }
   const isDecisionName = n => /screen|decision|include|exclu|incl|verdict/i.test(n);
 
-  function renderMap(draft, aiPick) {
+  function renderMap(draft) {
     view = 'map';
-    const ws = draft.wb.Sheets[draft.sheet];
-    const headers = headersOf(ws);
     const ex = draft.existing;
+    const multiSheet = draft.wb.SheetNames.length > 1;
+    const ws = draft.sheet ? draft.wb.Sheets[draft.sheet] : null; // null until the user picks a sheet
+    const headers = ws ? headersOf(ws) : [];
     const prev = ex && ex.sheet === draft.sheet ? ex.cols : null;
     // Reuse the column choices of another file in this project with the same headers.
-    const sibling = !ex && cur.srcs.find(src => {
+    const sibling = ws && !ex && cur.srcs.find(src => {
       const h = headersOf(src.wb.Sheets[src.s.sheet]).map(x => x.name).join('|');
       return h === headers.map(x => x.name).join('|');
     });
@@ -533,13 +534,15 @@
         <h1>${ex ? 'Change columns' : 'Match your columns'}</h1>
         <p class="muted small">${esc(draft.fileName)}</p>
       </div>
+      ${multiSheet ? `<div class="field"><label for="m-sheet">Sheet</label>
+        <select id="m-sheet">${ws ? '' : '<option value="" selected disabled>Choose a sheet</option>'}${draft.wb.SheetNames.map(n => `<option${n === draft.sheet ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select>
+        ${ws ? '' : '<span class="hint">This file has more than one sheet. Pick the one with your records.</span>'}</div>` : ''}
       <div class="ai-row">
-        <button class="btn magic" id="m-ai" type="button">${ICON.magic}<span>Identify the columns for me</span></button>
+        <button class="btn magic" id="m-ai" type="button"${ws ? '' : ' disabled'}>${ICON.magic}<span>Identify the columns for me</span></button>
+        ${ws ? '' : '<p class="hint small faint">Choose a sheet first.</p>'}
         <p class="ai-note" id="m-ai-note" hidden></p>
       </div>
-      <div class="fields">
-        ${draft.wb.SheetNames.length > 1 ? `<div class="field"><label for="m-sheet">Sheet</label>
-          <select id="m-sheet">${draft.wb.SheetNames.map(n => `<option${n === draft.sheet ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select></div>` : ''}
+      ${ws ? `<div class="fields">
         <div class="pair">
           <div class="field"><label for="m-title">Title column</label><select id="m-title">${opts(sel.title, false)}</select></div>
           <div class="field"><label for="m-tdec">Title screening decision column</label><select id="m-tdec">${opts(sel.titleDec, true, DEFAULT_HEADER.t)}</select></div>
@@ -550,12 +553,15 @@
         </div>
         <p class="hint small faint">Decisions are written as 1 = include, 0 = exclude, 2 = maybe. Values already in a decision column are kept and count as screened.</p>
       </div>
-      <div class="preview" id="m-preview"></div>
+      <div class="preview" id="m-preview"></div>` : ''}
       <p class="error" id="m-err" hidden></p>
-      <div class="row"><button class="btn primary" id="m-go">${ex ? 'Save columns' : 'Add file to project'}</button></div>
+      <div class="row"><button class="btn primary" id="m-go"${ws ? '' : ' disabled'}>${ex ? 'Save columns' : 'Add file to project'}</button></div>
     </div></section>`;
 
     const $ = id => document.getElementById(id);
+    if ($('m-sheet')) $('m-sheet').addEventListener('change', e => renderMap({ ...draft, sheet: e.target.value }));
+    if (!ws) return; // nothing else to set up until a sheet is chosen
+
     const read = () => ({
       title: $('m-title').value === '' ? null : +$('m-title').value,
       abs: $('m-abs').value === '' ? null : +$('m-abs').value,
@@ -574,44 +580,33 @@
     };
     preview();
     ['m-title', 'm-abs', 'm-tdec', 'm-adec'].forEach(id => $(id).addEventListener('change', preview));
-    if ($('m-sheet')) $('m-sheet').addEventListener('change', e => renderMap({ ...draft, sheet: e.target.value }));
-
-    // Fill the form from the column finder's answer (positions are within the chosen sheet).
-    const applyPick = pick => {
-      const note = $('m-ai-note');
-      const setSel = (id, pos, allowNew) => {
-        const el = $(id);
-        el.value = pos >= 0 && headers[pos] ? String(headers[pos].c) : (allowNew ? 'new' : '');
-        el.closest('.field').classList.add('ai-picked');
-      };
-      if ($('m-sheet')) $('m-sheet').closest('.field').classList.add('ai-picked');
-      setSel('m-title', pick.title, false);
-      setSel('m-abs', pick.abstract, false);
-      setSel('m-tdec', pick.title_decision, true);
-      setSel('m-adec', pick.abstract_decision, true);
-      preview();
-      const multi = draft.wb.SheetNames.length > 1;
-      const missing = [pick.title < 0 && 'title', pick.abstract < 0 && 'abstract'].filter(Boolean);
-      const what = multi ? `the “${draft.sheet}” sheet and these columns` : 'these columns';
-      note.textContent = (missing.length
-        ? `Claude picked ${multi ? `the “${draft.sheet}” sheet` : 'some columns'} but couldn’t find a ${missing.join(' or ')} column. Pick it yourself, then tap Looks right.`
-        : `Claude picked ${what}. Check them, then tap Looks right.`) + (pick.note ? ' ' + pick.note : '');
-      note.hidden = false;
-      $('m-go').textContent = 'Looks right';
-      $('m-ai').querySelector('span').textContent = 'Identify again';
-    };
 
     $('m-ai').addEventListener('click', async () => {
-      const btn = $('m-ai');
+      const btn = $('m-ai'), note = $('m-ai-note');
       btn.disabled = true;
       btn.classList.add('busy');
       btn.querySelector('span').textContent = 'Reading your file…';
-      $('m-ai-note').hidden = true;
+      note.hidden = true;
       $('m-err').hidden = true;
       try {
-        const pick = await identifyColumns(draft.wb);
-        if (pick.sheetName !== draft.sheet) return renderMap({ ...draft, sheet: pick.sheetName }, pick); // re-render on the chosen sheet
-        applyPick(pick);
+        const pick = await identifyColumns(ws, headers);
+        const setSel = (id, pos, allowNew) => {
+          const el = $(id);
+          el.value = pos >= 0 && headers[pos] ? String(headers[pos].c) : (allowNew ? 'new' : '');
+          el.closest('.field').classList.add('ai-picked');
+        };
+        setSel('m-title', pick.title, false);
+        setSel('m-abs', pick.abstract, false);
+        setSel('m-tdec', pick.title_decision, true);
+        setSel('m-adec', pick.abstract_decision, true);
+        preview();
+        const missing = [pick.title < 0 && 'title', pick.abstract < 0 && 'abstract'].filter(Boolean);
+        note.textContent = (missing.length
+          ? `Claude couldn’t find a ${missing.join(' or ')} column. Pick it yourself, then tap Looks right.`
+          : 'Claude picked the columns outlined in purple. Check them, then tap Looks right.') + (pick.note ? ' ' + pick.note : '');
+        note.hidden = false;
+        $('m-go').textContent = 'Looks right';
+        btn.querySelector('span').textContent = 'Identify again';
       } catch (e) {
         $('m-err').textContent = e.message || 'The column finder didn’t work. Pick the columns yourself.';
         $('m-err').hidden = false;
@@ -620,7 +615,6 @@
       btn.disabled = false;
       btn.classList.remove('busy');
     });
-    if (aiPick) applyPick(aiPick);
 
     $('m-go').addEventListener('click', async () => {
       const s = read();
@@ -638,34 +632,23 @@
     });
   }
 
-  // Send every sheet's name, size, headers and a few sample values per column to the column finder.
-  async function identifyColumns(wb) {
-    const names = wb.SheetNames.slice(0, 15);
-    const multi = names.length > 1;
-    const perSample = multi ? 3 : 4, cut = multi ? 200 : 240;
-    let budget = 300; // columns across all sheets
-    const sheets = names.map(name => {
-      const ws = wb.Sheets[name];
-      if (!ws || !ws['!ref']) return { name, rows: 0, columns: [] };
-      const rg = rangeOf(ws);
-      const headers = headersOf(ws).slice(0, Math.min(80, Math.max(0, budget)));
-      budget -= headers.length;
-      const columns = headers.map(h => {
-        const samples = [];
-        for (let r = rg.s.r + 1; r <= rg.e.r && samples.length < perSample; r++) {
-          const v = cellText(ws, r, h.c);
-          if (v) samples.push(v.length > cut ? v.slice(0, cut) + '…' : v);
-        }
-        return { name: h.name, samples };
-      });
-      return { name, rows: Math.max(0, rg.e.r - rg.s.r), columns };
+  // Send the chosen sheet's headers and a few sample values per column to the column finder.
+  async function identifyColumns(ws, headers) {
+    const rg = rangeOf(ws);
+    const columns = headers.slice(0, 80).map(h => {
+      const samples = [];
+      for (let r = rg.s.r + 1; r <= rg.e.r && samples.length < 4; r++) {
+        const v = cellText(ws, r, h.c);
+        if (v) samples.push(v.length > 240 ? v.slice(0, 240) + '…' : v);
+      }
+      return { name: h.name, samples };
     });
     let res;
     try {
       res = await fetch(AI_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + AI_ANON, apikey: AI_ANON },
-        body: JSON.stringify({ sheets }),
+        body: JSON.stringify({ columns }),
       });
     } catch {
       throw new Error('Couldn’t reach the column finder. Check your connection, or pick the columns yourself.');
@@ -673,9 +656,7 @@
     let body = null;
     try { body = await res.json(); } catch {}
     if (!res.ok || !body || body.error) throw new Error((body && body.error) || 'The column finder didn’t work. Pick the columns yourself.');
-    const sheetName = names[body.sheet ?? 0];
-    if (!sheetName || !sheets[names.indexOf(sheetName)].columns.length) throw new Error('Claude picked an empty sheet. Choose the sheet and columns yourself.');
-    return { ...body, sheetName };
+    return body;
   }
 
   async function finishMapping(draft, cols, newHeaders) {

@@ -10,13 +10,11 @@ const ALLOWED_ORIGINS = new Set([
   "http://127.0.0.1:8765",
   "http://localhost:8765",
 ]);
-const MAX_SHEETS = 15;
-const MAX_COLUMNS = 80;        // per sheet
-const MAX_TOTAL_COLUMNS = 300; // across all sheets
+const MAX_COLUMNS = 80;
 const MAX_SAMPLES = 4;
 const MAX_NAME = 200;
 const MAX_SAMPLE = 240;
-const MAX_BODY_BYTES = 250_000;
+const MAX_BODY_BYTES = 250_000; // older clients may still send every sheet
 
 // Light per-IP rate limit (per function instance): 15 requests a minute.
 const hits = new Map<string, number[]>();
@@ -49,33 +47,30 @@ function reply(status: number, body: unknown, origin: string | null) {
 }
 
 const SYSTEM = `You help researchers set up title and abstract screening for a systematic review.
-You get a spreadsheet of search results as a list of sheets. Each sheet has its position, name, number of data rows (when known), and its columns: each column's position, its header, and a few sample values.
-First pick the sheet that holds the records to screen: the list of articles with titles and usually abstracts. It is normally the sheet with the most records. Ignore sheets that only hold notes, search strategies, PRISMA counts, summaries or settings.
-Then, within that sheet only, pick the column positions for:
+You get the columns of one sheet of search results: each column's position, its header, and a few sample values.
+Pick the column positions for:
 - title: the article or record title.
 - abstract: the abstract or summary text.
 - title_decision: an existing column that records title screening decisions (include/exclude, 1/0, yes/no). Use -1 if there isn't one.
 - abstract_decision: an existing column that records abstract screening decisions. Use -1 if there isn't one.
 Judge by both the header and the sample values: titles are one sentence long, abstracts are paragraphs.
 Never pick the same column twice. Use -1 for title or abstract only if no column fits.
-In note, write one short plain sentence about anything the user should double-check, or an empty string. Refer to sheets and columns by their names, never by position numbers.`;
+In note, write one short plain sentence about anything the user should double-check, or an empty string. Refer to columns by their headers, never by position numbers.`;
 
 const OUTPUT = jsonSchemaOutputFormat({
   type: "object",
   properties: {
-    sheet: { type: "integer" },
     title: { type: "integer" },
     abstract: { type: "integer" },
     title_decision: { type: "integer" },
     abstract_decision: { type: "integer" },
     note: { type: "string" },
   },
-  required: ["sheet", "title", "abstract", "title_decision", "abstract_decision", "note"],
+  required: ["title", "abstract", "title_decision", "abstract_decision", "note"],
   additionalProperties: false,
 } as const);
 
 type Column = { name: string; samples: string[] };
-type Sheet = { name: string; rows: number | null; columns: Column[] };
 
 function cleanColumnList(raw: unknown): Column[] | null {
   if (!Array.isArray(raw) || raw.length > MAX_COLUMNS) return null;
@@ -89,25 +84,15 @@ function cleanColumnList(raw: unknown): Column[] | null {
   return out;
 }
 
-// Accepts { sheets: [{ name, rows, columns }] }, or the older { columns } (one sheet).
-function cleanSheets(input: unknown): Sheet[] | null {
+// Accepts { columns } (one sheet). Older clients sent { sheets: [...] }; use the first sheet then.
+function cleanInput(input: unknown): Column[] | null {
   if (!input || typeof input !== "object") return null;
-  const body = input as { sheets?: unknown; columns?: unknown };
-  const rawSheets = Array.isArray(body.sheets) ? body.sheets : Array.isArray(body.columns) ? [{ name: "Sheet1", rows: null, columns: body.columns }] : null;
-  if (!rawSheets || !rawSheets.length || rawSheets.length > MAX_SHEETS) return null;
-  const out: Sheet[] = [];
-  let total = 0;
-  for (const sh of rawSheets) {
-    if (!sh || typeof sh !== "object") return null;
-    const columns = cleanColumnList((sh as { columns?: unknown }).columns);
-    if (!columns) return null;
-    total += columns.length;
-    const rawRows = (sh as { rows?: unknown }).rows;
-    const rows = rawRows == null ? null : Number(rawRows);
-    out.push({ name: String((sh as { name?: unknown }).name ?? "").slice(0, MAX_NAME), rows: rows != null && Number.isFinite(rows) ? Math.max(0, Math.floor(rows)) : null, columns });
-  }
-  if (total === 0 || total > MAX_TOTAL_COLUMNS) return null;
-  return out;
+  const body = input as { columns?: unknown; sheets?: unknown };
+  const raw = Array.isArray(body.columns) ? body.columns
+    : Array.isArray(body.sheets) && body.sheets[0] && typeof body.sheets[0] === "object" ? (body.sheets[0] as { columns?: unknown }).columns
+    : null;
+  const columns = cleanColumnList(raw);
+  return columns && columns.length ? columns : null;
 }
 
 Deno.serve(async (req: Request) => {
@@ -121,21 +106,16 @@ Deno.serve(async (req: Request) => {
 
   const text = await req.text();
   if (text.length > MAX_BODY_BYTES) return reply(413, { error: "Too much data sent." }, origin);
-  let sheets: Sheet[] | null = null;
-  try { sheets = cleanSheets(JSON.parse(text)); } catch { sheets = null; }
-  if (!sheets) return reply(400, { error: "Send the spreadsheet's sheets and columns." }, origin);
+  let columns: Column[] | null = null;
+  try { columns = cleanInput(JSON.parse(text)); } catch { columns = null; }
+  if (!columns) return reply(400, { error: "Send the spreadsheet's columns." }, origin);
 
   if (!apiKey()) {
     console.error("ANTHROPIC_API_KEY secret is not set");
     return reply(503, { error: "The column finder isn’t set up yet. Pick the columns yourself for now." }, origin);
   }
 
-  const listing = sheets.map((sh, si) => ({
-    sheet: si,
-    name: sh.name || "(no name)",
-    ...(sh.rows == null ? {} : { rows: sh.rows }),
-    columns: sh.columns.map((c, i) => ({ position: i, header: c.name || "(no header)", samples: c.samples })),
-  }));
+  const listing = columns.map((c, i) => ({ position: i, header: c.name || "(no header)", samples: c.samples }));
 
   try {
     const client = new Anthropic({ apiKey: apiKey() }); // key comes from the function's secrets, whitespace removed
@@ -149,15 +129,18 @@ Deno.serve(async (req: Request) => {
     if (response.stop_reason === "refusal") return reply(502, { error: "Claude couldn’t identify the columns for this file." }, origin);
     const out = response.parsed_output;
     if (!out) return reply(502, { error: "Claude’s answer couldn’t be read. Try again." }, origin);
-    if (!Number.isInteger(out.sheet) || out.sheet < 0 || out.sheet >= sheets.length) {
-      return reply(502, { error: "Claude picked a sheet that doesn’t exist. Try again." }, origin);
-    }
-    const width = sheets[out.sheet].columns.length;
-    const ok = (n: number) => Number.isInteger(n) && n >= -1 && n < width;
+    const ok = (n: number) => Number.isInteger(n) && n >= -1 && n < columns!.length;
     if (![out.title, out.abstract, out.title_decision, out.abstract_decision].every(ok)) {
       return reply(502, { error: "Claude picked a column that doesn’t exist. Try again." }, origin);
     }
-    return reply(200, out, origin);
+    // Users know columns by their headers, not by Claude's position numbers.
+    const note = out.note.replace(/\b(column|position)\s+(\d+)\b/gi, (m: string, _w: string, n: string, at: number, all: string) => {
+      const c = columns![Number(n)];
+      if (!c || !c.name) return m;
+      const startOfSentence = at === 0 || /[.!?]\s*$/.test(all.slice(0, at));
+      return `${startOfSentence ? "The" : "the"} “${c.name}” column`;
+    });
+    return reply(200, { ...out, note }, origin);
   } catch (e) {
     if (e instanceof Anthropic.AuthenticationError || e instanceof Anthropic.PermissionDeniedError) {
       console.error("Claude key rejected", e.status);
